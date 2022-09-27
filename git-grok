@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+from dataclasses import dataclass
+import json
+from subprocess import check_output, CalledProcessError, Popen
+from typing import Literal, TypeVar
+import argparse
+import os
+import re
+import shlex
+import subprocess
+import sys
+import traceback
+
+PULL_REQUEST_HEADER = "Pull Request"
+BODY_SUFFIX_TITLE = "## PRs in the Stack"
+BODY_SUFFIX_TRAIL = "(The stack is managed by git-grok.)"
+
+
+#
+# A parsed commit from the local git folder.
+#
+@dataclass
+class Commit:
+    hash: str
+    author: str | None
+    url: str | None
+    title: str
+    description: str
+    branch: str | None
+
+
+#
+# A parsed remote PR loaded from GitHub.
+#
+@dataclass
+class Pr:
+    number: str
+    title: str
+    body: str
+    base_branch: str
+    head_branch: str
+    url: str
+
+
+BranchPushResult = Literal["pushed", "up-to-date"]
+
+BranchType = Literal["base", "head"]
+
+PrUpsertResult = Literal["created", "updated", "up-to-date"]
+
+CommitUpdateResult = Literal["updated", "up-to-date"]
+
+T = TypeVar("T")
+
+
+class Main:
+    shell_commands: list[list[str]] = []
+    login: str
+    remote: str
+    debug: bool = False
+    remote_base_branch: str = "master"
+
+    #
+    # Main entry point.
+    #
+    def run(self):
+        parser = argparse.ArgumentParser(
+            description="Pushes local commits as stacked PRs on GitHub and keeps them in sync."
+        )
+        parser.add_argument(
+            "--head",
+            default=False,
+            action="store_true",
+            help="process only the topmost (head) commit",
+        )
+        parser.add_argument(
+            "--debug",
+            default=False,
+            action="store_true",
+            help="print git and gh command lines",
+        )
+        args = parser.parse_args()
+
+        self.debug = args.debug
+
+        try:
+            self.login = self.gh_get_current_login()
+            self.remote = self.git_get_current_remote()
+            self.remote_base_branch = self.git_get_current_remote_base_branch()
+            if args.head:
+                self.run_head()
+            else:
+                self.run_all()
+        finally:
+            if self.debug:
+                for cmd in self.shell_commands:
+                    self.print_header(colored(92, 92, 92, "$ " + shlex.join(cmd)))
+
+    #
+    # Runs the sync for only the top commit. This is an internal command which
+    # is used during interactive rebase.
+    #
+    def run_head(self):
+        remote_commit = self.git_get_commits(
+            since_ref=f"remotes/{self.remote}/HEAD", count=1
+        )[0]
+        commits = self.git_get_commits(since_ref="HEAD", count=2)
+        if len(commits) < 2:
+            raise UserException("The repository must have at least 2 commits")
+        commit, prev_commit = commits[0], commits[1]
+
+        self.print_header(f"Processing commit: {commit.title}")
+
+        if prev_commit.hash != remote_commit.hash:
+            prev_commit, result = self.process_commit_push_branch(commit=prev_commit)
+            self.print_branch_result(
+                type="base", branch=str(prev_commit.branch), result=result
+            )
+        else:
+            self.print_branch_result(type="base", branch="HEAD", result="up-to-date")
+            prev_commit.branch = None
+
+        commit, result = self.process_commit_push_branch(commit=commit)
+        self.print_branch_result(type="head", branch=str(commit.branch), result=result)
+
+        if not commit.url:
+            assert commit.branch is not None
+            url, result = self.gh_create_pr(
+                base_branch=prev_commit.branch,
+                head_branch=commit.branch,
+                title=commit.title,
+            )
+            if result != "up-to-date":
+                self.print_pr_result(url=url, result=result)
+            commit.url = url
+
+            result = self.git_update_current_commit_message(
+                header_name=PULL_REQUEST_HEADER, header_value=commit.url
+            )
+            if result != "up-to-date":
+                self.print_commit_result(result=result)
+
+    #
+    # Assuming all PRs in the stack already have PR URLs in their description,
+    # pushes the updated branches and updates the PRs descriptions with the full
+    # list of commits in the stack.
+    #
+    def run_all(self):
+        commits = self.git_get_commits()
+        if len(commits) == 0:
+            self.print_header(
+                f"There are no local commits on top of {self.remote}. Commit something and rerun."
+            )
+            return
+
+        # Inject "Pull Request" URL to commit descriptions starting from the
+        # commit which doesn't have it. This is a heavy-weighted process which
+        # is run for each commit in an interactive rebase, starting from bottom
+        # to the very top.
+        commit_with_no_url = next(
+            (commit for commit in reversed(commits) if not commit.url), None
+        )
+        if commit_with_no_url:
+            self.process_create_missing_prs(
+                start_hash=commit_with_no_url.hash,
+            )
+
+        # Update PRs for commits; they now all have URLs.
+        commits = self.git_get_commits()
+        self.process_update_existing_prs(commits=commits)
+
+    #
+    # Starting from commit with hash start_hash which has no PR URL in the
+    # description, creates the missing PRs and updates commits descriptions with
+    # the returned URL.
+    #
+    def process_create_missing_prs(self, *, start_hash: str):
+        try:
+            self.git_rebase_interactive_exec(
+                cmd=shlex.join(
+                    [__file__, "--head", *(["--debug"] if self.debug else [])]
+                ),
+                start_hash=start_hash,
+            )
+        except (CalledProcessError, KeyboardInterrupt) as e:
+            self.shell_no_throw(["git", "rebase", "--abort"])
+            raise e
+
+    #
+    # Iterates over the list of commits with URLs and pushes their branches to
+    # update the corresponding PRs.
+    #
+    def process_update_existing_prs(self, *, commits: list[Commit]):
+        # We must iterate from the oldest commit to the newest one, because
+        # previous commit PR's branch becomes the next commit PR's base branch.
+        commits_chronological = list(reversed(commits))
+        for i, commit in enumerate(commits_chronological):
+            self.print_header(f"Updating PR: {commit.title}")
+
+            commit, result = self.process_commit_push_branch(commit=commit)
+            if result == "pushed":
+                self.print_branch_result(
+                    type="head", branch=str(commit.branch), result=result
+                )
+            commits_chronological[i] = commit
+
+            assert commit.url is not None
+            pr, result = self.process_update_pr(
+                prev_commit=commits_chronological[i - 1] if i > 0 else None,
+                commit=commit,
+                commits=commits,
+            )
+            self.print_pr_result(url=pr.url, result=result)
+
+    #
+    # Pushes an existing branch (it we know this commit's PR URL by querying
+    # GitHub), or creates a new branch based on commit title and pushes it.
+    #
+    def process_commit_push_branch(
+        self, *, commit: Commit
+    ) -> tuple[Commit, BranchPushResult]:
+        if commit.url:
+            pr = self.gh_get_pr(url=commit.url)
+            commit.branch = pr.head_branch
+        else:
+            commit.branch = self.build_branch_name(commit.title)
+        pushed = self.git_push_branch(branch=commit.branch, hash=commit.hash)
+        return commit, pushed
+
+    #
+    # Updates PR fields:
+    # - base branch (in case the commits were reordered, or some of them were
+    #   merged into the remote, so the the beginning of the stack started
+    #   pointing not to a branch, but to a remote tip)
+    # - full stack list in the description
+    #
+    # It's BTW not possible to update the head branch once PR is created.
+    #
+    def process_update_pr(
+        self, *, prev_commit: Commit | None, commit: Commit, commits: list[Commit]
+    ) -> tuple[Pr, PrUpsertResult]:
+        body_suffix: list[str] = []
+        for c in commits:
+            assert c.url is not None
+            m = re.search(r"/(\d+)$", str(c.url))
+            if m:
+                body_suffix.append(
+                    f"- {'➡ ' if c.hash == commit.hash else ''}#{m.group(1)}"
+                )
+        assert commit.url is not None
+        return self.gh_update_pr(
+            url=commit.url,
+            base_branch=prev_commit.branch if prev_commit else None,
+            body_suffix_title=BODY_SUFFIX_TITLE,
+            body_suffix_body="\n".join(body_suffix) + "\n\n" + BODY_SUFFIX_TRAIL,
+        )
+
+    #
+    # Returns current GitHub login.
+    #
+    def gh_get_current_login(self):
+        return self.shell(["gh", "api", "user", "--jq", ".login"])
+
+    #
+    # Returns current git folder remote (most often "origin").
+    #
+    def git_get_current_remote(self):
+        return self.shell(["git", "remote", "show"])
+
+    #
+    # Returns the current remote branch name on GitHub.
+    #
+    def git_get_current_remote_base_branch(self):
+        branch = self.shell(["git", "branch", "--show-current"])
+        if not branch:
+            path = ".git/rebase-merge/head-name"
+            file = find_file_in_parents(path)
+            if file:
+                branch = open(file).readline().strip()
+                m = re.match(r"refs/heads/(.+)", branch)
+                if not m:
+                    raise UserException(f"File {path} doesn't contain refs/heads/*")
+            else:
+                raise UserException(
+                    f"You must be on a branch or in an interactive rebase mode."
+                )
+        return branch
+
+    #
+    # Returns current git folder owner name and repository name.
+    #
+    def gh_get_current_repo(self):
+        return self.shell(
+            [
+                "gh",
+                "repo",
+                "view",
+                "--json",
+                "owner,name",
+                "--jq",
+                "[.owner.login,.name]|join('/')",
+            ]
+        )
+
+    #
+    # Creates a GitHub PR between two existing branches.
+    #
+    def gh_create_pr(
+        self, *, base_branch: str | None, head_branch: str, title: str
+    ) -> tuple[str, PrUpsertResult]:
+        if not base_branch:
+            base_branch = self.remote_base_branch
+        body_file = find_file_in_parents(".github/pull_request_template.md")
+        cmd = [
+            "gh",
+            "pr",
+            "create",
+            "--base",
+            base_branch,
+            "--head",
+            head_branch,
+            "--title",
+            title,
+            *(["--body-file", body_file] if body_file else ["--body", ""]),
+        ]
+        returncode, output, stderr = self.shell_no_throw(cmd)
+        if returncode == 0:
+            return output, "created"
+        m = re.match(r"^.* already exists[^\n]\n(\S+)", stderr, flags=re.S)
+        if m:
+            return m.group(1), "up-to-date"
+        raise CalledProcessError(
+            returncode=returncode, cmd=cmd, output=output, stderr=stderr
+        )
+
+    #
+    # Updates base_branch and description suffix of the PR.
+    #
+    def gh_update_pr(
+        self,
+        *,
+        url: str,
+        base_branch: str | None,
+        body_suffix_title: str,
+        body_suffix_body: str,
+    ) -> tuple[Pr, PrUpsertResult]:
+        if base_branch is None:
+            base_branch = self.remote_base_branch
+
+        pr = self.gh_get_pr(url=url)
+        parts = re.split(
+            r"^" + re.escape(body_suffix_title) + r"[^\n]*\n",
+            pr.body,
+            flags=re.M,
+        )
+        new_body = (
+            (parts[0] if len(parts) > 1 else pr.body.rstrip() + "\n")
+            + body_suffix_title
+            + "\n"
+            + body_suffix_body
+        )
+        if pr.base_branch == base_branch and pr.body == new_body:
+            return pr, "up-to-date"
+        self.shell(
+            [
+                "gh",
+                "pr",
+                "edit",
+                url,
+                "--base",
+                base_branch,
+                "--body-file",
+                "-",
+            ],
+            input=new_body,
+        )
+        return pr, "updated"
+
+    #
+    # Reads PR info from GitHub.
+    #
+    def gh_get_pr(self, *, url: str):
+        out = json.loads(
+            self.shell(
+                [
+                    "gh",
+                    "pr",
+                    "view",
+                    url,
+                    "--json",
+                    "number,title,body,baseRefName,headRefName,url",
+                ],
+            )
+        )
+        return Pr(
+            number=out["number"],
+            title=out["title"],
+            body=out["body"],
+            base_branch=re.sub(r"^refs/heads/", "", out["baseRefName"]),
+            head_branch=re.sub(r"^refs/heads/", "", out["headRefName"]),
+            url=out["url"],
+        )
+
+    #
+    # Returns parsed commits between two refs.
+    #
+    def git_get_commits(
+        self,
+        *,
+        since_ref: str | None = None,
+        till_ref: str | None = None,
+        count: int | None = None,
+    ):
+        if since_ref is None:
+            since_ref = "HEAD"
+        if till_ref is None:
+            till_ref = f"remotes/{self.remote}/HEAD"
+        if count:
+            out = self.shell(["git", "log", since_ref, f"-{count}"])
+        else:
+            out = self.shell(["git", "log", f"{since_ref}...{till_ref}"])
+        commits: list[Commit] = []
+        for commit in re.split(r"^(?=commit )", out, flags=re.M)[1:]:
+            try:
+                m = re.match(r"^commit (\w+)[^\n]*\n(.*?)\n\n(.*)$", commit, flags=re.S)
+                if not m:
+                    raise UserException("Can't parse commit-headers-body.")
+                hash, headers, body = m.group(1), m.group(2), m.group(3).rstrip()
+
+                m = re.match(r"^Author: ([^\n]+)", headers, flags=re.M)
+                if not m:
+                    raise UserException("Can't extract Author header.")
+                author = m.group(1) if m else None
+
+                m = re.match(r"^([^\n]+)\n?(.*)$", body, flags=re.S)
+                if not m:
+                    raise UserException(f"Can't extract commit title and description.")
+                title, description = m.group(1).strip(), m.group(2)
+
+                m = re.match(
+                    rf"^\s+{PULL_REQUEST_HEADER}: (https://\S+)",
+                    description,
+                    flags=re.M,
+                )
+                url = m.group(1).strip() if m else None
+            except UserException as e:
+                raise UserException(f"{str(e)} Commit:\n<<<\n{commit.strip()}\n>>")
+            except BaseException as e:
+                tb = traceback.format_exc()
+                raise UserException(f"{tb}\nCommit:\n<<<\n{commit.strip()}\n>>\n\n")
+
+            commits.append(
+                Commit(
+                    hash=hash,
+                    author=author,
+                    url=url,
+                    title=title,
+                    description=description,
+                    branch=None,
+                )
+            )
+        return commits
+
+    #
+    # Pushes a branch to remote GitHub.
+    #
+    def git_push_branch(self, *, branch: str, hash: str) -> BranchPushResult:
+        existing_hash = self.shell_no_throw(
+            ["git", "show", "-s", "--format=%H", f"remotes/{self.remote}/{branch}"]
+        )[1]
+        if existing_hash == hash:
+            return "up-to-date"
+        self.shell(
+            [
+                "git",
+                "push",
+                "--quiet",
+                "-f",
+                self.remote,
+                f"{hash}:refs/heads/{branch}",
+            ],
+        )
+        return "pushed"
+
+    #
+    # Runs an interactive rebase with the provided shell command.
+    #
+    def git_rebase_interactive_exec(self, *, cmd: str, start_hash: str):
+        self.shell_passthrough(
+            [
+                "git",
+                "rebase",
+                "--quiet",
+                "--interactive",
+                "--exec",
+                cmd,
+                f"{start_hash}^",
+            ],
+            env={"GIT_EDITOR": "true"},
+            skip_re=r"Executing: ",
+        )
+
+    #
+    # Updates the message suffix (pointing to a PR URL) of the current commit
+    # which is at the moment selected (activated) with interactive rebase.
+    #
+    def git_update_current_commit_message(
+        self, *, header_name: str, header_value: str
+    ) -> CommitUpdateResult:
+        new_header = f"{header_name}: {header_value}"
+        message = self.shell(
+            ["git", "show", "--pretty=format:%B", "--no-patch"],
+            no_rstrip=True,
+        )
+        m = re.match(rf"^{header_name}: [^\n]+", message, flags=re.M)
+        if m:
+            new_message = message.replace(m[0], new_header)
+        else:
+            new_message = f"{message.rstrip()}\n\n{new_header}"
+        if new_message != message:
+            self.shell(["git", "commit", "--amend", "-F", "-"], input=new_message)
+            return "updated"
+        else:
+            return "up-to-date"
+
+    #
+    # Runs a shell command returning results.
+    #
+    def shell(
+        self,
+        cmd: list[str],
+        *,
+        no_rstrip: bool = False,
+        input: str | None = None,
+        env: dict[str, str] | None = None,
+    ):
+        self.shell_commands.append(cmd)
+        out = check_output(cmd, text=True, stderr=subprocess.PIPE, input=input, env=env)
+        return out if no_rstrip else out.rstrip()
+
+    def shell_no_throw(self, cmd: list[str], *, no_rstrip: bool = False):
+        self.shell_commands.append(cmd)
+        proc = Popen(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        stdout, stderr = proc.communicate()
+        return (
+            proc.returncode,
+            stdout if no_rstrip else stdout.rstrip(),
+            stderr if no_rstrip else stderr.rstrip(),
+        )
+
+    #
+    # Runs a shell command, but prints its output as is.
+    #
+    def shell_passthrough(
+        self,
+        cmd: list[str],
+        *,
+        env: dict[str, str] | None = None,
+        skip_re: str | None = None,
+    ):
+        self.shell_commands.append(cmd)
+        with Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env={**os.environ, **env} if env else None,
+        ) as pipe:
+            assert pipe.stdout is not None
+            for line in pipe.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                if skip_re == None or not re.search(skip_re, line, flags=re.S):
+                    print(line)
+                    sys.stdout.flush()
+            returncode = pipe.wait()
+            if returncode != 0:
+                raise CalledProcessError(returncode=returncode, cmd=cmd)
+
+    #
+    # Builds branch name from commit title.
+    #
+    def build_branch_name(self, title: str):
+        branch = title
+        branch = branch.strip()
+        branch = re.sub(r"^\w[()[]]+:\s+", "", branch)
+        branch = re.sub(r"\[[-\w]+\]$", "", branch)
+        branch = branch.lower()
+        branch = re.sub(r"^\W+|\W+$", "", branch)
+        branch = re.sub(r"\W+", "-", branch)
+        return f"grok/{self.login}/{branch}"
+
+    #
+    # Prints a status after a branch push attempt happened.
+    #
+    def print_branch_result(
+        self, *, type: BranchType, branch: str, result: BranchPushResult
+    ):
+        print(f"  ✅ {type}: {self.remote}/{branch} ({result})")
+        sys.stdout.flush()
+
+    #
+    # Prints a status after a PR was created/updated on GitHub.
+    #
+    def print_pr_result(self, *, url: str, result: PrUpsertResult):
+        print(f"  ✅ {url} ({result})")
+        sys.stdout.flush()
+
+    #
+    # Prints a status after a commit message was updated locally.
+    #
+    def print_commit_result(self, *, result: CommitUpdateResult):
+        print(f"  ✅ commit message ({result})")
+        sys.stdout.flush()
+
+    #
+    # Prints the heading message of an operation.
+    #
+    def print_header(self, header: str):
+        print(header)
+        sys.stdout.flush()
+
+
+#
+# Splits a list into chunks of size n.
+#
+def chunk(lst: list[T], n: int) -> list[list[T]]:
+    res: list[list[T]] = []
+    for i in range(0, len(lst), n):
+        res.append(lst[i : i + n])
+    return res
+
+
+#
+# Returns a colored text.
+#
+def colored(r: int, g: int, b: int, text: str):
+    return f"\033[38;2;{r};{g};{b}m{text}\033[0m"
+
+
+#
+# Traverse the filesystem from the current directory to root trying to find a
+# matching relative file path in parent directories.
+#
+def find_file_in_parents(file: str):
+    path = os.getcwd()
+    old_path = None
+    while old_path != path:
+        full = os.path.join(path, file)
+        if os.path.exists(full):
+            return full
+        old_path = path
+        path = os.path.dirname(path)
+    return None
+
+
+#
+# If raised, the stacktrace is not shown.
+#
+class UserException(Exception):
+    pass
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(Main().run())
+    except UserException as e:
+        print(str(e))
+        sys.exit(1)
+    except CalledProcessError as e:
+        print(
+            f'Command "{shlex.join(e.cmd)}" returned status {e.returncode}.'
+            + (f"\n{e.stderr}" if e.stderr else ""),
+            file=sys.stderr,
+        )
+        sys.exit(2)
