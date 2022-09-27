@@ -91,6 +91,7 @@ class Main:
                 self.run_head()
             else:
                 self.run_all()
+            print("")
         finally:
             if self.debug:
                 for cmd in self.shell_commands:
@@ -109,7 +110,7 @@ class Main:
             raise UserException("The repository must have at least 2 commits")
         commit, prev_commit = commits[0], commits[1]
 
-        self.print_header(f"Processing commit: {commit.title}")
+        self.print_header(f"Processing commit: {self.clean_title(commit.title)}")
 
         if prev_commit.hash != remote_commit.hash:
             prev_commit, result = self.process_commit_push_branch(commit=prev_commit)
@@ -195,7 +196,7 @@ class Main:
         # previous commit PR's branch becomes the next commit PR's base branch.
         commits_chronological = list(reversed(commits))
         for i, commit in enumerate(commits_chronological):
-            self.print_header(f"Updating PR: {commit.title}")
+            self.print_header(f"Updating PR: {self.clean_title(commit.title)}")
 
             commit, result = self.process_commit_push_branch(commit=commit)
             if result == "pushed":
@@ -579,12 +580,20 @@ class Main:
                 raise CalledProcessError(returncode=returncode, cmd=cmd)
 
     #
+    # Cleans a title from useless prefix/suffix.
+    #
+    def clean_title(self, title: str):
+        title = title.strip()
+        title = re.sub(r"^\w+[()\[\]\w]*:\s+", "", title)
+        title = re.sub(r"\[[-\w]+\]$", "", title)
+        return title.strip()
+
+    #
     # Builds branch name from commit title.
     #
     def build_branch_name(self, title: str):
         branch = title
         branch = branch.strip()
-        branch = re.sub(r"^\w[()[]]+:\s+", "", branch)
         branch = re.sub(r"\[[-\w]+\]$", "", branch)
         branch = branch.lower()
         branch = re.sub(r"^\W+|\W+$", "", branch)
@@ -604,7 +613,7 @@ class Main:
     # Prints a status after a PR was created/updated on GitHub.
     #
     def print_pr_result(self, *, url: str, result: PrUpsertResult):
-        print(f"  ✅ {url} ({result})")
+        print(f"  😎 {url} ({result})")
         sys.stdout.flush()
 
     #
