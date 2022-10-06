@@ -247,6 +247,7 @@ class Main:
             self.print_pr_result(
                 url=pr.url, result=result, review_decision=pr.review_decision
             )
+            commits_chronological[i].branch = pr.head_branch
 
     #
     # Pushes an existing branch (it we know this commit's PR URL by querying
@@ -415,6 +416,8 @@ class Main:
             ],
             input=new_body,
         )
+        pr.base_branch = base_branch
+        pr.body = new_body
         return pr, "updated"
 
     #
