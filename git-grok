@@ -10,6 +10,7 @@ import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
+from datetime import datetime
 from subprocess import CalledProcessError, Popen, check_output
 from typing import Literal, TypeVar
 
@@ -18,6 +19,7 @@ BODY_SUFFIX_TITLE = "## PRs in the Stack"
 BODY_SUFFIX_TRAIL = "(The stack is managed by git-grok.)"
 MAX_BRANCH_LEN_IN_PRINT = 36
 MAX_TITLE_LEN_IN_PRINT = 50
+DEBUG_FILE = "/tmp/git-grok.log"
 
 
 #
@@ -60,7 +62,7 @@ T = TypeVar("T")
 
 
 class Main:
-    shell_commands: list[list[str]] = []
+    shell_commands: list[tuple[list[str], str | None]] = []
     login: str
     remote: str
     debug: bool = False
@@ -90,6 +92,11 @@ class Main:
         self.debug = args.debug
 
         try:
+            self.self_update()
+            # For debug purposes only.
+            self.shell_no_throw(["git", "status"])
+            self.shell_no_throw(["git", "log", "--graph", "--decorate", "-3"])
+            # Below is the real work.
             self.login = self.gh_get_current_login()
             self.remote = self.git_get_current_remote()
             self.remote_base_branch = self.git_get_current_remote_base_branch()
@@ -99,9 +106,7 @@ class Main:
                 self.run_all()
             print("")
         finally:
-            if self.debug:
-                for cmd in self.shell_commands:
-                    self.print_header(colored(92, 92, 92, "$ " + shlex.join(cmd)))
+            self.debug_log_flush()
 
     #
     # Runs the sync for only the top commit. This is an internal command which
@@ -572,25 +577,50 @@ class Main:
         no_rstrip: bool = False,
         input: str | None = None,
         env: dict[str, str] | None = None,
-    ):
-        self.shell_commands.append(cmd)
-        out = check_output(cmd, text=True, stderr=subprocess.PIPE, input=input, env=env)
-        return out if no_rstrip else out.rstrip()
+    ) -> str:
+        out = None
+        try:
+            out = check_output(
+                cmd, text=True, stderr=subprocess.PIPE, input=input, env=env
+            )
+            return out if no_rstrip else out.rstrip()
+        finally:
+            self.debug_log_shell_command(cmd=cmd, out=out)
 
-    def shell_no_throw(self, cmd: list[str], *, no_rstrip: bool = False):
-        self.shell_commands.append(cmd)
-        proc = Popen(
-            cmd,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        stdout, stderr = proc.communicate()
-        return (
-            proc.returncode,
-            stdout if no_rstrip else stdout.rstrip(),
-            stderr if no_rstrip else stderr.rstrip(),
-        )
+    #
+    # Same as shell(), but never throws and returns an exit code along with the
+    # outputs instead.
+    #
+    def shell_no_throw(
+        self,
+        cmd: list[str],
+        *,
+        no_rstrip: bool = False,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str, str]:
+        stdout = ""
+        stderr = ""
+        try:
+            proc = Popen(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={**os.environ, **env} if env else None,
+            )
+            stdout, stderr = proc.communicate()
+            if not no_rstrip:
+                stdout = stdout.rstrip()
+                stderr = stderr.rstrip()
+            return (
+                proc.returncode,
+                stdout,
+                stderr,
+            )
+        finally:
+            self.debug_log_shell_command(
+                cmd=cmd, out="\n".join([s for s in [stdout, stderr] if s])
+            )
 
     #
     # Runs a shell command, but prints its output as is.
@@ -602,26 +632,41 @@ class Main:
         env: dict[str, str] | None = None,
         skip_re: str | None = None,
     ):
-        self.shell_commands.append(cmd)
-        with Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env={**os.environ, **env} if env else None,
-        ) as pipe:
-            assert pipe.stdout is not None
-            for line in pipe.stdout:
-                line = line.rstrip()
-                if not line:
-                    continue
-                if skip_re == None or not re.search(skip_re, line, flags=re.S):
-                    print(line)
-                    sys.stdout.flush()
-            returncode = pipe.wait()
-            if returncode != 0:
-                raise CalledProcessError(returncode=returncode, cmd=cmd)
+        out = ""
+        try:
+            with Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env={**os.environ, **env} if env else None,
+            ) as pipe:
+                assert pipe.stdout is not None
+                for line in pipe.stdout:
+                    line = line.rstrip()
+                    if not line:
+                        continue
+                    out += line + "\n"
+                    if skip_re == None or not re.search(skip_re, line, flags=re.S):
+                        print(line)
+                        sys.stdout.flush()
+                returncode = pipe.wait()
+                if returncode != 0:
+                    raise CalledProcessError(returncode=returncode, cmd=cmd)
+        finally:
+            self.debug_log_shell_command(cmd=cmd, out=out)
+
+    #
+    # Tries to self-update the tool by pulling from git.
+    #
+    def self_update(self):
+        dir = os.path.dirname(os.path.realpath(__file__))
+        if not os.path.exists(f"{dir}/.git"):
+            return
+        self.shell_no_throw(
+            ["bash", "-c", f"cd {shlex.quote(dir)} && git pull --rebase"]
+        )
 
     #
     # Cleans a title from useless prefix/suffix.
@@ -693,6 +738,45 @@ class Main:
     def print_header(self, header: str):
         print(header)
         sys.stdout.flush()
+
+    #
+    # Logs a command which is run by the tool.
+    #
+    def debug_log_shell_command(self, *, cmd: list[str], out: str | None):
+        self.shell_commands.append((cmd, out))
+
+    #
+    # Prints some debug info.
+    #
+    def debug_log_flush(self):
+        out: list[tuple[tuple[int, int, int], str]] = []
+        for cmd in self.shell_commands:
+            out.append(((128, 128, 128), "$ " + shlex.join(cmd[0]).strip()))
+            if cmd[1]:
+                out.append(
+                    (
+                        (92, 92, 92),
+                        re.sub(
+                            r"^",
+                            "  ",
+                            re.sub(r"\n([| \t]*\n)+", "\n", cmd[1].rstrip()),
+                            flags=re.M,
+                        ),
+                    )
+                )
+        try:
+            with open(DEBUG_FILE, "a+") as file:
+                file.write(f"=== {datetime.now()}\n")
+                for row in out:
+                    file.write(row[1] + "\n")
+                file.write("\n")
+        except:
+            pass
+
+        if self.debug:
+            for row in out:
+                print(colored(*row[0], row[1]))
+            sys.stdout.flush()
 
 
 #
