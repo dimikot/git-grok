@@ -50,6 +50,7 @@ class Pr:
     head_branch: str
     url: str
     review_decision: PrReviewDecision
+    state: Literal["OPEN", "CLOSED", "MERGED"]
 
 
 BranchPushResult = Literal["pushed", "up-to-date"]
@@ -202,6 +203,8 @@ class Main:
             else:
                 commit_hashes_to_push_branch.append(commit.hash)
 
+        # Some commits have no related PRs (no GitHub URLs in the message)?
+        # Create missing PRs and amend their messages (via rebase interactive).
         if commit_with_no_url:
             self.process_create_missing_prs(
                 start_hash=commit_with_no_url.hash,
@@ -468,7 +471,7 @@ class Main:
                     "view",
                     url,
                     "--json",
-                    "number,title,body,baseRefName,headRefName,url,reviewDecision",
+                    "number,title,body,baseRefName,headRefName,url,reviewDecision,state",
                 ],
             ),
         )
@@ -481,6 +484,7 @@ class Main:
             head_branch=re.sub(r"^refs/heads/", "", out["headRefName"]),
             url=out["url"],
             review_decision=out["reviewDecision"],
+            state=out["state"],
         )
 
     #
@@ -637,6 +641,7 @@ class Main:
         *,
         no_rstrip: bool = False,
         env: dict[str, str] | None = None,
+        comment: str | None = None,
     ) -> tuple[int, str, str]:
         stdout = ""
         stderr = ""
@@ -665,6 +670,7 @@ class Main:
                     [s for s in [stdout, stderr] if s],
                 ),
                 took_s=time() - time_start,
+                comment=comment,
             )
 
     #
@@ -676,9 +682,10 @@ class Main:
         *,
         env: dict[str, str] | None = None,
         skip_re: str | None = None,
+        comment: str | None = None,
     ):
         out = ""
-        self.debug_log_shell_command(cmd=cmd, out="", took_s=0)
+        self.debug_log_shell_command(cmd=cmd, out="", took_s=0, comment=comment)
         with Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -708,7 +715,8 @@ class Main:
         if not os.path.exists(f"{dir}/.git"):
             return
         self.shell_no_throw(
-            ["bash", "-c", f"cd {shlex.quote(dir)} && git pull --rebase"]
+            ["bash", "-c", f"cd {shlex.quote(dir)} && git pull --rebase"],
+            comment="self-update",
         )
 
     #
