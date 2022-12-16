@@ -12,14 +12,18 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from subprocess import CalledProcessError, Popen, check_output
-from typing import Literal, TypeVar
+from time import time
+from typing import Callable, Literal, TypeVar
 
+BRANCH_PREFIX = "grok/"
 PULL_REQUEST_HEADER = "Pull Request"
 BODY_SUFFIX_TITLE = "## PRs in the Stack"
 BODY_SUFFIX_TRAIL = "(The stack is managed by git-grok.)"
 MAX_BRANCH_LEN_IN_PRINT = 36
 MAX_TITLE_LEN_IN_PRINT = 50
 DEBUG_FILE = "/tmp/git-grok.log"
+DEBUG_COLOR_GRAY_1 = (128, 128, 128)
+DEBUG_COLOR_GRAY_2 = (92, 92, 92)
 
 
 #
@@ -62,10 +66,11 @@ T = TypeVar("T")
 
 
 class Main:
-    shell_commands: list[tuple[list[str], str | None]] = []
+    in_rebase_interactive: bool = False
+    debug: bool = False
+    debug_force_push_branches: bool = False
     login: str
     remote: str
-    debug: bool = False
     remote_base_branch: str = "master"
 
     #
@@ -76,7 +81,7 @@ class Main:
             description="Pushes local commits as stacked PRs on GitHub and keeps them in sync."
         )
         parser.add_argument(
-            "--head",
+            "--in-rebase-interactive",
             default=False,
             action="store_true",
             help="process only the topmost (head) commit",
@@ -87,32 +92,46 @@ class Main:
             action="store_true",
             help="print git and gh command lines",
         )
+        parser.add_argument(
+            "--debug-force-push-branches",
+            default=False,
+            action="store_true",
+            help="if passed, forces all branches to be re-created and re-pushed",
+        )
         args = parser.parse_args()
 
+        self.in_rebase_interactive = args.in_rebase_interactive
         self.debug = args.debug
+        self.debug_force_push_branches = args.debug_force_push_branches
 
-        try:
+        if not self.in_rebase_interactive:
             self.self_update()
-            # For debug purposes only.
-            self.shell_no_throw(["git", "status"])
-            self.shell_no_throw(["git", "log", "--graph", "--decorate", "-3"])
-            # Below is the real work.
-            self.login = self.gh_get_current_login()
-            self.remote = self.git_get_current_remote()
-            self.remote_base_branch = self.git_get_current_remote_base_branch()
-            if args.head:
-                self.run_head()
-            else:
-                self.run_all()
-            print("")
-        finally:
-            self.debug_log_flush()
+
+        # For debug purposes only.
+        self.shell_no_throw(["git", "status"])
+        self.shell_no_throw(["git", "log", "--graph", "--decorate", "-3"])
+        # Below is the real work.
+        self.login = self.cache_through(
+            "gh_get_current_login", self.gh_get_current_login
+        )
+        self.remote = self.cache_through(
+            "git_get_current_remote", self.git_get_current_remote
+        )
+        self.remote_base_branch = self.cache_through(
+            "git_get_current_remote_base_branch",
+            self.git_get_current_remote_base_branch,
+        )
+        if self.in_rebase_interactive:
+            self.run_in_rebase_interactive()
+        else:
+            self.run_all()
+        print("")
 
     #
     # Runs the sync for only the top commit. This is an internal command which
     # is used during interactive rebase.
     #
-    def run_head(self):
+    def run_in_rebase_interactive(self):
         remote_commit = self.git_get_commits(
             latest_ref=f"remotes/{self.remote}/{self.remote_base_branch}",
             count_back_in_time=1,
@@ -177,7 +196,7 @@ class Main:
         commit_with_no_url: Commit | None = None
         commit_hashes_to_push_branch: list[str] = []
         for commit in reversed(commits):
-            if not commit.url:
+            if not commit.url or self.debug_force_push_branches:
                 commit_with_no_url = commit
                 break
             else:
@@ -187,6 +206,7 @@ class Main:
             self.process_create_missing_prs(
                 start_hash=commit_with_no_url.hash,
             )
+            commits = self.git_get_commits()
 
         # Update PRs for commits; they now all have URLs. Do not push branches
         # for commits for which we have just created missing PRs above (if any),
@@ -197,8 +217,7 @@ class Main:
         # to predict in advance), i.e. the sequence is "push branch - create PR
         # - update commit message - push branch", but the last step of this
         # sequence is delayed till the next run, when the author has some other
-        # updates to piggy-back luckily.
-        commits = self.git_get_commits()
+        # updates to piggy-back likely.
         self.process_update_existing_prs(
             commits=commits, commit_hashes_to_push_branch=commit_hashes_to_push_branch
         )
@@ -212,7 +231,16 @@ class Main:
         try:
             self.git_rebase_interactive_exec(
                 cmd=shlex.join(
-                    [__file__, "--head", *(["--debug"] if self.debug else [])]
+                    [
+                        __file__,
+                        "--in-rebase-interactive",
+                        *(["--debug"] if self.debug else []),
+                        *(
+                            ["--debug-force-push-branches"]
+                            if self.debug_force_push_branches
+                            else []
+                        ),
+                    ]
                 ),
                 start_hash=start_hash,
             )
@@ -408,6 +436,8 @@ class Main:
         )
         if pr.base_branch == base_branch and pr.body == new_body:
             return pr, "up-to-date"
+
+        self.cache_clean(url)
         self.shell(
             [
                 "gh",
@@ -429,8 +459,9 @@ class Main:
     # Reads PR info from GitHub.
     #
     def gh_get_pr(self, *, url: str):
-        out = json.loads(
-            self.shell(
+        out_str = self.cache_through(
+            url,
+            lambda: self.shell(
                 [
                     "gh",
                     "pr",
@@ -439,8 +470,9 @@ class Main:
                     "--json",
                     "number,title,body,baseRefName,headRefName,url,reviewDecision",
                 ],
-            )
+            ),
         )
+        out = json.loads(out_str)
         return Pr(
             number=out["number"],
             title=out["title"],
@@ -512,7 +544,7 @@ class Main:
         existing_hash = self.shell_no_throw(
             ["git", "show", "-s", "--format=%H", f"remotes/{self.remote}/{branch}"]
         )[1]
-        if existing_hash == hash:
+        if existing_hash == hash and not self.debug_force_push_branches:
             return "up-to-date"
         self.shell(
             [
@@ -577,15 +609,23 @@ class Main:
         no_rstrip: bool = False,
         input: str | None = None,
         env: dict[str, str] | None = None,
+        comment: str | None = None,
     ) -> str:
         out = None
+        time_start = time()
         try:
             out = check_output(
-                cmd, text=True, stderr=subprocess.PIPE, input=input, env=env
+                cmd,
+                text=True,
+                stderr=subprocess.PIPE,
+                input=input,
+                env={**os.environ, **env} if env else None,
             )
             return out if no_rstrip else out.rstrip()
         finally:
-            self.debug_log_shell_command(cmd=cmd, out=out)
+            self.debug_log_shell_command(
+                cmd=cmd, out=out, took_s=time() - time_start, comment=comment
+            )
 
     #
     # Same as shell(), but never throws and returns an exit code along with the
@@ -600,6 +640,7 @@ class Main:
     ) -> tuple[int, str, str]:
         stdout = ""
         stderr = ""
+        time_start = time()
         try:
             proc = Popen(
                 cmd,
@@ -619,7 +660,11 @@ class Main:
             )
         finally:
             self.debug_log_shell_command(
-                cmd=cmd, out="\n".join([s for s in [stdout, stderr] if s])
+                cmd=cmd,
+                out="\n".join(
+                    [s for s in [stdout, stderr] if s],
+                ),
+                took_s=time() - time_start,
             )
 
     #
@@ -633,29 +678,27 @@ class Main:
         skip_re: str | None = None,
     ):
         out = ""
-        try:
-            with Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env={**os.environ, **env} if env else None,
-            ) as pipe:
-                assert pipe.stdout is not None
-                for line in pipe.stdout:
-                    line = line.rstrip()
-                    if not line:
-                        continue
-                    out += line + "\n"
-                    if skip_re == None or not re.search(skip_re, line, flags=re.S):
-                        print(line)
-                        sys.stdout.flush()
-                returncode = pipe.wait()
-                if returncode != 0:
-                    raise CalledProcessError(returncode=returncode, cmd=cmd)
-        finally:
-            self.debug_log_shell_command(cmd=cmd, out=out)
+        self.debug_log_shell_command(cmd=cmd, out="", took_s=0)
+        with Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env={**os.environ, **env} if env else None,
+        ) as pipe:
+            assert pipe.stdout is not None
+            for line in pipe.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                out += line + "\n"
+                if skip_re == None or not re.search(skip_re, line, flags=re.S):
+                    print(line)
+                    sys.stdout.flush()
+            returncode = pipe.wait()
+            if returncode != 0:
+                raise CalledProcessError(returncode=returncode, cmd=cmd)
 
     #
     # Tries to self-update the tool by pulling from git.
@@ -689,7 +732,7 @@ class Main:
         branch = branch.lower()
         branch = re.sub(r"^\W+|\W+$", "", branch)
         branch = re.sub(r"\W+", "-", branch)
-        return f"grok/{self.login}/{branch}"
+        return f"{BRANCH_PREFIX}{self.login}/{branch}"
 
     #
     # Prints a status after a branch push attempt happened.
@@ -742,41 +785,76 @@ class Main:
     #
     # Logs a command which is run by the tool.
     #
-    def debug_log_shell_command(self, *, cmd: list[str], out: str | None):
-        self.shell_commands.append((cmd, out))
-
-    #
-    # Prints some debug info.
-    #
-    def debug_log_flush(self):
-        out: list[tuple[tuple[int, int, int], str]] = []
-        for cmd in self.shell_commands:
-            out.append(((128, 128, 128), "$ " + shlex.join(cmd[0]).strip()))
-            if cmd[1]:
-                out.append(
-                    (
-                        (92, 92, 92),
-                        re.sub(
-                            r"^",
-                            "  ",
-                            re.sub(r"\n([| \t]*\n)+", "\n", cmd[1].rstrip()),
-                            flags=re.M,
-                        ),
-                    )
+    def debug_log_shell_command(
+        self,
+        *,
+        cmd: list[str],
+        out: str | None,
+        took_s: float,
+        comment: str | None = None,
+    ):
+        rows: list[tuple[tuple[int, int, int], str]] = []
+        rows.append(
+            (
+                DEBUG_COLOR_GRAY_1,
+                "$ "
+                + shlex.join(cmd).strip()
+                + (f" # took {int(took_s * 1000)} ms" if took_s else "")
+                + (f" # {comment}" if comment else ""),
+            )
+        )
+        if out:
+            rows.append(
+                (
+                    DEBUG_COLOR_GRAY_2,
+                    re.sub(
+                        r"^",
+                        "  ",
+                        re.sub(r"\n([| \t]*\n)+", "\n", out.rstrip()),
+                        flags=re.M,
+                    ),
                 )
+            )
+
+        if self.in_rebase_interactive:
+            rows = [(row[0], re.sub(r"^", "> ", row[1], flags=re.M)) for row in rows]
+
         try:
             with open(DEBUG_FILE, "a+") as file:
                 file.write(f"=== {datetime.now()}\n")
-                for row in out:
+                for row in rows:
                     file.write(row[1] + "\n")
                 file.write("\n")
         except:
             pass
 
         if self.debug:
-            for row in out:
+            for row in rows:
                 print(colored(*row[0], row[1]))
             sys.stdout.flush()
+
+    #
+    # Caches the return value of a function in environment and returns it next time
+    # it's requested.
+    #
+    def cache_through(self, key: str, func: Callable[[], str]):
+        var = f"GIT_GROK:{key}"
+        value = os.environ.get(var, None)
+        if value is None:
+            value = func()
+            os.environ[var] = value
+        else:
+            self.debug_log_shell_command(
+                cmd=["printenv", var], out=value, took_s=0, comment="cache hit"
+            )
+        return value
+
+    #
+    # Removes the cached value for the key.
+    #
+    def cache_clean(self, key: str):
+        var = f"GIT_GROK:{key}"
+        os.environ.pop(var, None)
 
 
 #
