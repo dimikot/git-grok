@@ -21,6 +21,7 @@ BODY_SUFFIX_TITLE = "## PRs in the Stack"
 BODY_SUFFIX_TRAIL = "(The stack is managed by git-grok.)"
 MAX_BRANCH_LEN_IN_PRINT = 36
 MAX_TITLE_LEN_IN_PRINT = 50
+TMP_BODY_FILE = "/tmp/git-grok.body"
 DEBUG_FILE = "/tmp/git-grok.log"
 DEBUG_COLOR_GRAY_1 = (128, 128, 128)
 DEBUG_COLOR_GRAY_2 = (92, 92, 92)
@@ -57,7 +58,7 @@ BranchPushResult = Literal["pushed", "up-to-date"]
 
 BranchType = Literal["base", "head"]
 
-PrUpsertResult = Literal["created", "updated", "up-to-date"]
+PrUpsertResult = Literal["created", "updated", "up-to-date", "reopened"]
 
 PrReviewDecision = Literal["APPROVED", "REVIEW_REQUIRED", "CHANGES_REQUESTED"]
 
@@ -158,6 +159,19 @@ class Main:
         commit, result = self.process_commit_push_branch(commit=commit)
         self.print_branch_result(type="head", branch=str(commit.branch), result=result)
 
+        new_pr_title = commit.title
+        new_pr_body = None
+        new_pr_fixes_accidentally_merged_one = False
+
+        if commit.url:
+            pr = self.gh_get_pr(url=commit.url)
+            if pr.state == "MERGED" and pr.base_branch.startswith(BRANCH_PREFIX):
+                self.print_pr_accidentally_merged()
+                commit.url = None
+                new_pr_fixes_accidentally_merged_one = True
+                new_pr_title = pr.title
+                new_pr_body = pr.body
+
         if not commit.url:
             assert (
                 commit.branch is not None
@@ -165,10 +179,15 @@ class Main:
             url, result = self.gh_create_pr(
                 base_branch=prev_commit.branch,
                 head_branch=commit.branch,
-                title=commit.title,
+                title=new_pr_title,
+                body=new_pr_body,
             )
             if result != "up-to-date":
-                self.print_pr_created()
+                self.print_pr_created(
+                    comment="instead of accidentally merged"
+                    if new_pr_fixes_accidentally_merged_one
+                    else None
+                )
             commit.url = url
 
             result = self.git_update_current_commit_message(
@@ -201,7 +220,12 @@ class Main:
                 commit_with_no_url = commit
                 break
             else:
-                commit_hashes_to_push_branch.append(commit.hash)
+                pr = self.gh_get_pr(url=commit.url)
+                if pr.state == "MERGED" and pr.base_branch.startswith(BRANCH_PREFIX):
+                    commit_with_no_url = commit
+                    break
+                else:
+                    commit_hashes_to_push_branch.append(commit.hash)
 
         # Some commits have no related PRs (no GitHub URLs in the message)?
         # Create missing PRs and amend their messages (via rebase interactive).
@@ -384,11 +408,18 @@ class Main:
     # Creates a GitHub PR between two existing branches.
     #
     def gh_create_pr(
-        self, *, base_branch: str | None, head_branch: str, title: str
+        self, *, base_branch: str | None, head_branch: str, title: str, body: str | None
     ) -> tuple[str, PrUpsertResult]:
         if not base_branch:
             base_branch = self.remote_base_branch
-        body_file = find_file_in_parents(".github/pull_request_template.md")
+
+        if body is not None:
+            body_file = TMP_BODY_FILE
+            with open(body_file, "w+") as file:
+                file.write(body)
+        else:
+            body_file = find_file_in_parents(".github/pull_request_template.md")
+
         cmd = [
             "gh",
             "pr",
@@ -437,10 +468,27 @@ class Main:
             + "\n"
             + body_suffix_body
         )
-        if pr.base_branch == base_branch and pr.body == new_body:
+        if pr.base_branch == base_branch and pr.body == new_body and pr.state == "OPEN":
             return pr, "up-to-date"
 
         self.cache_clean(url)
+
+        upsert_result = "updated"
+
+        if pr.state != "OPEN":
+            upsert_result = "reopened"
+            self.shell(
+                [
+                    "gh",
+                    "pr",
+                    "reopen",
+                    url,
+                    "--comment",
+                    "Reopened by git-grok.",
+                ],
+                input=new_body,
+            )
+
         self.shell(
             [
                 "gh",
@@ -454,9 +502,10 @@ class Main:
             ],
             input=new_body,
         )
+
         pr.base_branch = base_branch
         pr.body = new_body
-        return pr, "updated"
+        return pr, upsert_result
 
     #
     # Reads PR info from GitHub.
@@ -545,22 +594,25 @@ class Main:
     # Pushes a branch to remote GitHub.
     #
     def git_push_branch(self, *, branch: str, hash: str) -> BranchPushResult:
-        existing_hash = self.shell_no_throw(
-            ["git", "show", "-s", "--format=%H", f"remotes/{self.remote}/{branch}"]
-        )[1]
-        if existing_hash == hash and not self.debug_force_push_branches:
-            return "up-to-date"
-        self.shell(
+        # Git push is a quick no-op on GitHub end if the branch isn't changed
+        # (it prints "Everything up-to-date"), so we always push and then verify
+        # the output for the status (instead of fetching from the remote and
+        # comparing the branch'es tip commit hash).
+        out = self.shell(
             [
                 "git",
                 "push",
-                "--quiet",
                 "-f",
                 self.remote,
                 f"{hash}:refs/heads/{branch}",
             ],
+            stderr_to_stdout=True,
         )
-        return "pushed"
+        return (
+            "up-to-date"
+            if re.match(r"^[^\n]+up-to-date", out, flags=re.S)
+            else "pushed"
+        )
 
     #
     # Runs an interactive rebase with the provided shell command.
@@ -612,6 +664,7 @@ class Main:
         *,
         no_rstrip: bool = False,
         input: str | None = None,
+        stderr_to_stdout: bool = False,
         env: dict[str, str] | None = None,
         comment: str | None = None,
     ) -> str:
@@ -621,7 +674,7 @@ class Main:
             out = check_output(
                 cmd,
                 text=True,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT if stderr_to_stdout else subprocess.PIPE,
                 input=input,
                 env={**os.environ, **env} if env else None,
             )
@@ -700,7 +753,7 @@ class Main:
                 if not line:
                     continue
                 out += line + "\n"
-                if skip_re == None or not re.search(skip_re, line, flags=re.S):
+                if skip_re is None or not re.search(skip_re, line, flags=re.S):
                     print(line)
                     sys.stdout.flush()
             returncode = pipe.wait()
@@ -756,8 +809,15 @@ class Main:
     #
     # Prints a "PR created" message.
     #
-    def print_pr_created(self):
-        print(f"  ── new Pull Request created")
+    def print_pr_created(self, *, comment: str | None = None):
+        print(f"  ── new Pull Request created" + (f" ({comment})" if comment else ""))
+        sys.stdout.flush()
+
+    #
+    # Prints a "PR was accidentally merged" message.
+    #
+    def print_pr_accidentally_merged(self):
+        print(f"  💀 this PR was accidentally merged into {BRANCH_PREFIX}*, recreating")
         sys.stdout.flush()
 
     #
