@@ -18,7 +18,14 @@ from typing import Callable, Literal, TypeVar
 BRANCH_PREFIX = "grok/"
 PULL_REQUEST_HEADER = "Pull Request"
 BODY_SUFFIX_TITLE = "## PRs in the Stack"
-BODY_SUFFIX_TRAIL = "(The stack is managed by git-grok.)"
+BODY_SUFFIX_FOOTER = (
+    "(The stack is managed by [git-grok](https://github.com/DmitryKoterov/git-grok).)"
+)
+BODY_SUFFIX_RE = (
+    rf"^ {re.escape(BODY_SUFFIX_TITLE)} [^\n]* \n"
+    + r"( (\s*(\n|\Z))* (- \s* [^\n]+ (\n|\Z)) )*"
+    + r"( (\s*(\n|\Z))* [^\n]+ \bgit-grok\b [^\n]+ (\n|\Z) )?"
+)
 MAX_BRANCH_LEN_IN_PRINT = 36
 MAX_TITLE_LEN_IN_PRINT = 50
 TMP_BODY_FILE = "/tmp/git-grok.body"
@@ -336,24 +343,25 @@ class Main:
     def process_update_pr(
         self, *, prev_commit: Commit | None, commit: Commit, commits: list[Commit]
     ) -> tuple[Pr, PrUpsertResult]:
-        body_suffix: list[str] = []
+        pr_numbers: list[int] = []
+        pr_number_current: int | None = None
         for c in commits:
             assert (
                 c.url is not None
             ), f"commit {c.hash} PR URL is expected to be in the message at this point"
-            m = re.search(r"/(\d+)$", str(c.url))
+            m = re.search(r"/(\d+)$", c.url)
             if m:
-                body_suffix.append(
-                    f"- {'➡ ' if c.hash == commit.hash else ''}#{m.group(1)}"
-                )
+                pr_numbers.append(int(m.group(1)))
+                if c.hash == commit.hash:
+                    pr_number_current = int(m.group(1))
         assert (
             commit.url is not None
         ), f"commit {commit.hash} PR URL is expected to be in the message at this point"
         return self.gh_update_pr(
             url=commit.url,
             base_branch=prev_commit.branch if prev_commit else None,
-            body_suffix_title=BODY_SUFFIX_TITLE,
-            body_suffix_body="\n".join(body_suffix) + "\n\n" + BODY_SUFFIX_TRAIL,
+            pr_numbers=pr_numbers,
+            pr_number_current=pr_number_current,
         )
 
     #
@@ -450,24 +458,14 @@ class Main:
         *,
         url: str,
         base_branch: str | None,
-        body_suffix_title: str,
-        body_suffix_body: str,
+        pr_numbers: list[int],
+        pr_number_current: int | None,
     ) -> tuple[Pr, PrUpsertResult]:
         if base_branch is None:
             base_branch = self.remote_base_branch
 
         pr = self.gh_get_pr(url=url)
-        parts = re.split(
-            r"^" + re.escape(body_suffix_title) + r"[^\n]*\n",
-            pr.body,
-            flags=re.M,
-        )
-        new_body = (
-            (parts[0] if len(parts) > 1 else pr.body.rstrip() + "\n\n")
-            + body_suffix_title
-            + "\n"
-            + body_suffix_body
-        )
+        new_body = body_suffix_upsert(pr.body, pr_numbers, pr_number_current)
         if pr.base_branch == base_branch and pr.body == new_body and pr.state == "OPEN":
             return pr, "up-to-date"
 
@@ -961,6 +959,25 @@ def find_file_in_parents(file: str):
         old_path = path
         path = os.path.dirname(path)
     return None
+
+
+#
+# If there is no body suffix in the body, appends it. Otherwise, replaces the
+# previous occurrence of the body suffix (heuristically found) with the new one.
+#
+def body_suffix_upsert(
+    body: str, pr_numbers: list[int], pr_number_current: int | None
+) -> str:
+    items = [
+        f"- {'➡ ' if pr_number == pr_number_current else ''}#{pr_number}"
+        for pr_number in pr_numbers
+    ]
+    suffix = (
+        BODY_SUFFIX_TITLE + "\n" + "\n".join(items) + "\n\n" + BODY_SUFFIX_FOOTER + "\n"
+    )
+    if re.search(BODY_SUFFIX_RE, body, flags=re.M | re.I | re.X):
+        return re.sub(BODY_SUFFIX_RE, suffix, body, flags=re.M | re.I | re.X)
+    return body.rstrip() + "\n\n" + suffix
 
 
 #
