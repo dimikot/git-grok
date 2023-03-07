@@ -1,7 +1,7 @@
 # Git-grok: stacked PRs and stacked diffs for GitHub
 
-The only stacked commits (stacked PRs, stacked diff — you name it) solution for
-GitHub which really works.
+The only stacked commits (stacked PRs, stacked diffs — you name it) solution for
+GitHub which... well... actually works in 2022+.
 
 One idempotent command to rule 'em all:
 
@@ -9,7 +9,7 @@ One idempotent command to rule 'em all:
 git grok
 ```
 
-No arguments. No rules. No interactivity. You just don't need all these.
+No arguments. No rules. No interactivity. We just don't need all of these.
 
 <img src="README.jpg"/>
 
@@ -64,7 +64,7 @@ git grok
 You can also reorder the commits freely in case the one in the middle got
 accepted earlier than the previous one. Just run `git grok` afterwards.
 
-Never use `git push` again.
+Forget branches and `git push` as a nightmare.
 
 
 ## How to Merge
