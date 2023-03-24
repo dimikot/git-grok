@@ -287,6 +287,10 @@ class Main:
                     ]
                 ),
                 start_hash=start_hash,
+                skip_res=[
+                    r"^You can fix the problem, and then run$",
+                    r"^\s*git rebase --continue$",
+                ],
             )
         except (CalledProcessError, KeyboardInterrupt) as e:
             self.shell_no_throw(["git", "rebase", "--abort"])
@@ -657,7 +661,13 @@ class Main:
     #
     # Runs an interactive rebase with the provided shell command.
     #
-    def git_rebase_interactive_exec(self, *, cmd: str, start_hash: str):
+    def git_rebase_interactive_exec(
+        self,
+        *,
+        cmd: str,
+        start_hash: str,
+        skip_res: list[str] = [],
+    ):
         self.shell_passthrough(
             [
                 "git",
@@ -669,7 +679,7 @@ class Main:
                 f"{start_hash}^",
             ],
             env={"GIT_EDITOR": "true"},
-            skip_re=r"Executing: ",
+            skip_res=[r"Executing: ", *skip_res],
         )
 
     #
@@ -781,7 +791,7 @@ class Main:
         cmd: list[str],
         *,
         env: dict[str, str] | None = None,
-        skip_re: str | None = None,
+        skip_res: list[str] = [],
         comment: str | None = None,
     ):
         out = ""
@@ -789,7 +799,7 @@ class Main:
         with Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.STDOUT,  # to apply skip_res to stderr as well
             text=True,
             bufsize=1,
             env={**os.environ, **env} if env else None,
@@ -800,7 +810,7 @@ class Main:
                 if not line:
                     continue
                 out += line + "\n"
-                if skip_re is None or not re.search(skip_re, line, flags=re.S):
+                if not any(re.search(r, line, flags=re.S) for r in skip_res):
                     print(line)
                     sys.stdout.flush()
             returncode = pipe.wait()
@@ -1059,6 +1069,7 @@ if __name__ == "__main__":
     except CalledProcessError as e:
         print(
             f'Command "{shlex.join(e.cmd)}" returned status {e.returncode}.'
+            + (f"\n{e.stdout}" if e.stdout else "")
             + (f"\n{e.stderr}" if e.stderr else ""),
             file=sys.stderr,
         )
