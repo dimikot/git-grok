@@ -706,7 +706,10 @@ class Main:
         else:
             new_message = f"{message.rstrip()}\n\n{new_header}"
         if new_message != message:
-            self.shell(["git", "commit", "--amend", "-F", "-"], input=new_message)
+            self.shell(
+                ["git", "commit", "--amend", "--no-verify", "-F", "-"],
+                input=new_message,
+            )
             return "updated"
         else:
             return "up-to-date"
