@@ -30,6 +30,8 @@ BODY_SUFFIX_RE = (
 MAX_BRANCH_LEN_IN_PRINT = 36
 MAX_TITLE_LEN_IN_PRINT = 50
 TMP_BODY_FILE = "/tmp/git-grok.body"
+INTERNAL_ENV_VAR_PREFIX = "GIT_GROK"
+INTERNAL_IN_REBASE_INTERACTIVE_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_in_rebase_interactive"
 DEBUG_FILE = "/tmp/git-grok.log"
 DEBUG_COLOR_GRAY_1 = (128, 128, 128)
 DEBUG_COLOR_GRAY_2 = (92, 92, 92)
@@ -91,12 +93,6 @@ class Main:
             description="Pushes local commits as stacked PRs on GitHub and keeps them in sync.",
         )
         parser.add_argument(
-            "--in-rebase-interactive",
-            default=False,
-            action="store_true",
-            help="process only the topmost (head) commit",
-        )
-        parser.add_argument(
             "--debug",
             default=False,
             action="store_true",
@@ -110,7 +106,9 @@ class Main:
         )
         args = parser.parse_args()
 
-        self.in_rebase_interactive = args.in_rebase_interactive
+        self.in_rebase_interactive = bool(
+            os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR, None)
+        )
         self.debug = args.debug
         self.debug_force_push_branches = args.debug_force_push_branches
 
@@ -273,19 +271,19 @@ class Main:
     #
     def process_create_missing_prs(self, *, start_hash: str):
         try:
+            cmd = shlex.join(
+                [
+                    __file__,
+                    *(["--debug"] if self.debug else []),
+                    *(
+                        ["--debug-force-push-branches"]
+                        if self.debug_force_push_branches
+                        else []
+                    ),
+                ]
+            )
             self.git_rebase_interactive_exec(
-                cmd=shlex.join(
-                    [
-                        __file__,
-                        "--in-rebase-interactive",
-                        *(["--debug"] if self.debug else []),
-                        *(
-                            ["--debug-force-push-branches"]
-                            if self.debug_force_push_branches
-                            else []
-                        ),
-                    ]
-                ),
+                cmd=f"{INTERNAL_IN_REBASE_INTERACTIVE_VAR}=1 {cmd}",
                 start_hash=start_hash,
                 skip_res=[
                     r"^You can fix the problem, and then run$",
@@ -980,7 +978,7 @@ class Main:
     # it's requested.
     #
     def cache_through(self, key: str, func: Callable[[], str]):
-        var = f"GIT_GROK:{key}"
+        var = f"{INTERNAL_ENV_VAR_PREFIX}:{key}"
         value = os.environ.get(var, None)
         if value is None:
             value = func()
@@ -998,7 +996,7 @@ class Main:
     # Removes the cached value for the key.
     #
     def cache_clean(self, key: str):
-        var = f"GIT_GROK:{key}"
+        var = f"{INTERNAL_ENV_VAR_PREFIX}:{key}"
         os.environ.pop(var, None)
 
 
