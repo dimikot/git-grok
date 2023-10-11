@@ -65,6 +65,8 @@ git add . && git commit -m "your commit message here"
 git grok
 ```
 
+<img src="media/git-grok-run-example.png" width="400"/>
+
 Now comes the beauty of stacked PRs workflow. At any time you can edit a local
 commit in the middle of the stack in your working copy and rerun `git grok` to
 update all the PRs automatically:
