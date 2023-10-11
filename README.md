@@ -72,19 +72,48 @@ Never use `git push` again.
 If your repository enforces code reviews on the main branch (so the only way to
 push there is through GitHub UI), the process is following.
 
-You merge the 1st commit in the stack by clicking the button in GitHub UI (it
-will go to the main branch).
+You "Squash and merge" the 1st PR in the stack by clicking the button in GitHub
+UI (it will go to the main branch).
 
-Run `git pull --rebase && git grok`
-
-Merge again.
-
-Run `git pull --rebase && git grok`.
+Then, GitHub is smart enough to update the base of the next PR in the stack to
+point to the main branch (hooray!). So you just switch to the 2nd PR in the
+stack and "Squash and merge" it.
 
 Rinse.
 
 Repeat.
 
-Pay attention to only merge (or rebase) into the main branch in GitHub UI. Set
-up protected branch rules which disallow merging from the UI to branches whose
-names start with `grok/`.
+Warning: pay attention to only merge (or rebase) into the main branch in GitHub
+UI. GitHub is smart, so it automatically changes the base of the next PR to main
+once its old branch is auto-deleted when you click "Squash and merge", but if
+you see something unusual, just rerun `git pull --rebase && git grok`
+
+If you want to auto-protect yourself, set up a GitHub action which disallows
+merging to `grok/` branches from the UI, and then set its check as required for
+merging in protected branches:
+
+```
+mkdir -p .github/workflows
+cat <<'EOT' > .github/workflows/disallow-grok-corruption.yml
+name: "Require the previous PR in the stack to be merged"
+on:
+  pull_request:
+    branches:
+      - grok/*/*
+      - master
+      - main
+    types:
+      - edited
+      - opened
+      - synchronize
+      - reopened
+jobs:
+  disallow-grok-corruption:
+    name: "Check that base branch is not grok/*"
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          set -o xtrace
+          if [[ "$GITHUB_BASE_REF" = grok/* ]]; then exit 1; else exit 0; fi
+EOT
+```
