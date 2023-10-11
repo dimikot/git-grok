@@ -121,7 +121,9 @@ class Main:
                 type="base", branch=str(prev_commit.branch), result=result
             )
         else:
-            self.print_branch_result(type="base", branch="HEAD", result="up-to-date")
+            self.print_branch_result(
+                type="base", branch=self.remote_base_branch, result="up-to-date"
+            )
             prev_commit.branch = None
 
         commit, result = self.process_commit_push_branch(commit=commit)
