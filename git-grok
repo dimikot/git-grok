@@ -62,6 +62,7 @@ class Pr:
     url: str
     review_decision: PrReviewDecision
     state: Literal["OPEN", "CLOSED", "MERGED"]
+    auto_merge_status: Literal["ENABLED", "DISABLED", "UNKNOWN"]
 
 
 BranchPushResult = Literal["pushed", "up-to-date"]
@@ -223,6 +224,8 @@ class Main:
             )
             return
 
+        self.process_validate_commits(commits=commits)
+
         # Inject "Pull Request" URL to commit descriptions starting from the
         # commit which doesn't have it. This is a heavy-weighted process which
         # is run for each commit in an interactive rebase, starting from bottom
@@ -263,6 +266,22 @@ class Main:
             commits=commits,
             commit_hashes_to_push_branch=commit_hashes_to_push_branch,
         )
+
+    #
+    # Checks that the tool can process this stack of commits at all.
+    #
+    def process_validate_commits(self, *, commits: list[Commit]):
+        commits_chronological = list(reversed(commits))
+        prs_chronological = self.gh_get_prs(commits=commits_chronological)
+        for i, pr in list(enumerate(prs_chronological))[1:]:
+            if pr and pr.auto_merge_status == "ENABLED":
+                prev_pr = prs_chronological[i - 1]
+                if not prev_pr or prev_pr.head_branch != pr.base_branch:
+                    raise UserException(
+                        f"PR {pr.url} is auto-mergeable.\n"
+                        + "I can't update it at GitHub without risking to auto-merge to an wrong branch.\n"
+                        + "Please disable auto-merge for the PR and try again."
+                    )
 
     #
     # Starting from commit with hash start_hash which has no PR URL in the
@@ -427,8 +446,8 @@ class Main:
     #
     # Returns current git folder owner name and repository name.
     #
-    def gh_get_current_repo(self):
-        return self.shell(
+    def gh_get_current_repo_owner_and_name(self) -> tuple[str, str]:
+        out_str = self.shell(
             [
                 "gh",
                 "repo",
@@ -436,9 +455,10 @@ class Main:
                 "--json",
                 "owner,name",
                 "--jq",
-                "[.owner.login,.name]|join('/')",
+                "[.owner.login,.name]",
             ]
         )
+        return tuple(json.loads(out_str))
 
     #
     # Creates a GitHub PR between two existing branches.
@@ -558,20 +578,111 @@ class Main:
                 ],
             ),
         )
-        out = json.loads(out_str)
+        value = json.loads(out_str)
         return Pr(
-            number=out["number"],
-            title=out["title"],
-            body=out["body"],
-            base_branch=re.sub(r"^refs/heads/", "", out["baseRefName"]),
-            head_branch=re.sub(r"^refs/heads/", "", out["headRefName"]),
-            url=out["url"],
-            review_decision=out["reviewDecision"],
-            state=out["state"],
+            number=value["number"],
+            title=value["title"],
+            body=value["body"],
+            base_branch=re.sub(r"^refs/heads/", "", value["baseRefName"]),
+            head_branch=re.sub(r"^refs/heads/", "", value["headRefName"]),
+            url=value["url"],
+            review_decision=value["reviewDecision"],
+            state=value["state"],
+            auto_merge_status="UNKNOWN",
         )
 
     #
-    # Returns parsed commits between two refs.
+    # Sends a remote API request to bulk-load of existing PRs mentioned in the
+    # provided list of commits. Returns PRs in the same order as commits. If no
+    # PR URL is mentioned in commit message, returns None at its place.
+    #
+    def gh_get_prs(self, *, commits: list[Commit]) -> list[Pr | None]:
+        @dataclass
+        class Field:
+            name: str
+            url: str
+            clause: str
+
+        fields: list[Field | None] = []
+        for i, commit in enumerate(commits):
+            if commit.url:
+                m = re.match(r".*/(\d+)$", commit.url)
+                if not m:
+                    raise UserException(
+                        f'Can\'t extract PR number from URL {commit.url} mentioned in the message of commit "{commit.title}"'
+                    )
+                field_name = f"f{i}"
+                pr_number = int(m.group(1))
+                fields.append(
+                    Field(
+                        name=field_name,
+                        url=commit.url,
+                        clause=f"  {field_name}: pullRequest(number: {pr_number}) "
+                        + "{ number, title, body, baseRefName, headRefName, url, reviewDecision, state, "
+                        + "autoMergeRequest { enabledAt } }\n",
+                    )
+                )
+            else:
+                fields.append(None)
+
+        clauses = [field.clause for field in fields if field]
+        if not clauses:
+            return [None for _ in commits]
+        query = (
+            "query($owner: String!, $name: String!) { repository(owner: $owner, name: $name) {\n"
+            + "".join(clauses)
+            + "} }"
+        )
+
+        (owner, name) = self.gh_get_current_repo_owner_and_name()
+        out_str = self.shell(
+            [
+                "gh",
+                "api",
+                "graphql",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-f",
+                f"query=\n{query}",
+            ],
+        )
+        out = json.loads(out_str)
+
+        repository = out.get("data", {}).get("repository", {})
+        if not repository:
+            raise UserException(
+                f"Can't extract PR infos from GitHub GraphQL response:\n"
+                + json.dumps(out, indent=2)
+            )
+
+        prs: list[Pr | None] = []
+        for field in fields:
+            value = field and repository.get(field.name)
+            if value:
+                prs.append(
+                    Pr(
+                        number=value["number"],
+                        title=value["title"],
+                        body=value["body"],
+                        base_branch=re.sub(r"^refs/heads/", "", value["baseRefName"]),
+                        head_branch=re.sub(r"^refs/heads/", "", value["headRefName"]),
+                        url=value["url"],
+                        review_decision=value["reviewDecision"],
+                        state=value["state"],
+                        auto_merge_status="ENABLED"
+                        if value["autoMergeRequest"]
+                        else "UNKNOWN",
+                    )
+                )
+            else:
+                prs.append(None)
+        return prs
+
+    #
+    # Returns parsed commits between two refs in reverse-chronological order
+    # (newest commits first, oldest last, as they're shown in "git log").
     #
     def git_get_commits(
         self,
@@ -1065,7 +1176,7 @@ if __name__ == "__main__":
     try:
         sys.exit(Main().run())
     except UserException as e:
-        print(str(e))
+        print(re.sub(r"^", "❌ ", str(e), flags=re.M))
         sys.exit(1)
     except CalledProcessError as e:
         print(
