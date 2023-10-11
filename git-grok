@@ -104,9 +104,10 @@ class Main:
     #
     def run_head(self):
         remote_commit = self.git_get_commits(
-            since_ref=f"remotes/{self.remote}/HEAD", count=1
+            latest_ref=f"remotes/{self.remote}/{self.remote_base_branch}",
+            count_back_in_time=1,
         )[0]
-        commits = self.git_get_commits(since_ref="HEAD", count=2)
+        commits = self.git_get_commits(latest_ref="HEAD", count_back_in_time=2)
         if len(commits) < 2:
             raise UserException("The repository must have at least 2 commits")
         commit, prev_commit = commits[0], commits[1]
@@ -126,7 +127,9 @@ class Main:
         self.print_branch_result(type="head", branch=str(commit.branch), result=result)
 
         if not commit.url:
-            assert commit.branch is not None
+            assert (
+                commit.branch is not None
+            ), f"commit {commit.hash} branch must be resolved"
             url, result = self.gh_create_pr(
                 base_branch=prev_commit.branch,
                 head_branch=commit.branch,
@@ -206,7 +209,9 @@ class Main:
                 )
             commits_chronological[i] = commit
 
-            assert commit.url is not None
+            assert (
+                commit.url is not None
+            ), f"commit {commit.hash} PR url is expected to be in the message at this point"
             pr, result = self.process_update_pr(
                 prev_commit=commits_chronological[i - 1] if i > 0 else None,
                 commit=commit,
@@ -243,13 +248,17 @@ class Main:
     ) -> tuple[Pr, PrUpsertResult]:
         body_suffix: list[str] = []
         for c in commits:
-            assert c.url is not None
+            assert (
+                c.url is not None
+            ), f"commit {c.hash} PR URL is expected to be in the message at this point"
             m = re.search(r"/(\d+)$", str(c.url))
             if m:
                 body_suffix.append(
                     f"- {'➡ ' if c.hash == commit.hash else ''}#{m.group(1)}"
                 )
-        assert commit.url is not None
+        assert (
+            commit.url is not None
+        ), f"commit {commit.hash} PR URL is expected to be in the message at this point"
         return self.gh_update_pr(
             url=commit.url,
             base_branch=prev_commit.branch if prev_commit else None,
@@ -282,6 +291,7 @@ class Main:
                 m = re.match(r"refs/heads/(.+)", branch)
                 if not m:
                     raise UserException(f"File {path} doesn't contain refs/heads/*")
+                branch = m.group(1)
             else:
                 raise UserException(
                     f"You must be on a branch or in an interactive rebase mode."
@@ -409,18 +419,18 @@ class Main:
     def git_get_commits(
         self,
         *,
-        since_ref: str | None = None,
-        till_ref: str | None = None,
-        count: int | None = None,
+        latest_ref: str | None = None,
+        earliest_ref: str | None = None,
+        count_back_in_time: int | None = None,
     ):
-        if since_ref is None:
-            since_ref = "HEAD"
-        if till_ref is None:
-            till_ref = f"remotes/{self.remote}/HEAD"
-        if count:
-            out = self.shell(["git", "log", since_ref, f"-{count}"])
+        if latest_ref is None:
+            latest_ref = "HEAD"
+        if earliest_ref is None:
+            earliest_ref = f"remotes/{self.remote}/{self.remote_base_branch}"
+        if count_back_in_time:
+            out = self.shell(["git", "log", latest_ref, f"-{count_back_in_time}"])
         else:
-            out = self.shell(["git", "log", f"{since_ref}...{till_ref}"])
+            out = self.shell(["git", "log", f"{earliest_ref}..{latest_ref}"])
         commits: list[Commit] = []
         for commit in re.split(r"^(?=commit )", out, flags=re.M)[1:]:
             try:
