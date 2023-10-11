@@ -23,7 +23,6 @@ BODY_SUFFIX_TRAIL = "(The stack is managed by git-grok.)"
 @dataclass
 class Commit:
     hash: str
-    author: str | None
     url: str | None
     title: str
     description: str
@@ -327,7 +326,7 @@ class Main:
         returncode, output, stderr = self.shell_no_throw(cmd)
         if returncode == 0:
             return output, "created"
-        m = re.match(r"^.* already exists[^\n]\n(\S+)", stderr, flags=re.S)
+        m = re.match(r".* already exists[^\n]\n(\S+)", stderr, flags=re.S)
         if m:
             return m.group(1), "up-to-date"
         raise CalledProcessError(
@@ -355,7 +354,7 @@ class Main:
             flags=re.M,
         )
         new_body = (
-            (parts[0] if len(parts) > 1 else pr.body.rstrip() + "\n")
+            (parts[0] if len(parts) > 1 else pr.body.rstrip() + "\n\n")
             + body_suffix_title
             + "\n"
             + body_suffix_body
@@ -423,22 +422,17 @@ class Main:
         commits: list[Commit] = []
         for commit in re.split(r"^(?=commit )", out, flags=re.M)[1:]:
             try:
-                m = re.match(r"^commit (\w+)[^\n]*\n(.*?)\n\n(.*)$", commit, flags=re.S)
+                m = re.match(r"commit (\w+)[^\n]*\n(.*?)\n\n(.*)$", commit, flags=re.S)
                 if not m:
                     raise UserException("Can't parse commit-headers-body.")
-                hash, headers, body = m.group(1), m.group(2), m.group(3).rstrip()
+                hash, _headers, body = m.group(1), m.group(2), m.group(3).rstrip()
 
-                m = re.match(r"^Author: ([^\n]+)", headers, flags=re.M)
-                if not m:
-                    raise UserException("Can't extract Author header.")
-                author = m.group(1) if m else None
-
-                m = re.match(r"^([^\n]+)\n?(.*)$", body, flags=re.S)
+                m = re.match(r"([^\n]+)\n?(.*)$", body, flags=re.S)
                 if not m:
                     raise UserException(f"Can't extract commit title and description.")
                 title, description = m.group(1).strip(), m.group(2)
 
-                m = re.match(
+                m = re.search(
                     rf"^\s+{PULL_REQUEST_HEADER}: (https://\S+)",
                     description,
                     flags=re.M,
@@ -453,7 +447,6 @@ class Main:
             commits.append(
                 Commit(
                     hash=hash,
-                    author=author,
                     url=url,
                     title=title,
                     description=description,
@@ -513,7 +506,7 @@ class Main:
             ["git", "show", "--pretty=format:%B", "--no-patch"],
             no_rstrip=True,
         )
-        m = re.match(rf"^{header_name}: [^\n]+", message, flags=re.M)
+        m = re.search(rf"^{header_name}: [^\n]+", message, flags=re.M)
         if m:
             new_message = message.replace(m[0], new_header)
         else:
