@@ -17,7 +17,7 @@ from typing import Callable, Literal, TypeVar
 
 BRANCH_PREFIX = "grok/"
 PR_HEADER = "Pull Request"
-PR_HEADER_RE = rf"^\s+{PR_HEADER}: (https://\S+)(?: \((.*?)\))"
+PR_HEADER_RE = rf"^\s+{PR_HEADER}: (https://\S+)(?: \((.*?)\))?"
 BODY_SUFFIX_TITLE = "## PRs in the Stack"
 BODY_SUFFIX_FOOTER = (
     "(The stack is managed by [git-grok](https://github.com/dimikot/git-grok).)"
