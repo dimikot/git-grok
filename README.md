@@ -1,22 +1,36 @@
 # Git-grok: stacked PRs and stacked diffs for GitHub
 
-The only stacked commits (stacked PRs, stacked diff — you name it) solution for
-GitHub which really works.
+Git-grok is the simplest stacked commits (stacked PRs, stacked diffs — you name
+it) solution for GitHub.
 
 One idempotent command to rule 'em all:
 
-```
+```bash
 git grok
 ```
 
-No arguments. No rules. No interactivity. You just don't need all these.
+No arguments. No configuration. No interactivity. On intent.
+
+If you frequently write code and find it tedious to manage interdependent
+branches (like when "branch A depends on branch B which itself depends on branch
+C"), there's an approach that avoids the use of branches entirely. This method,
+known as "stacked PRs", is used in Meta, Google and other leading companies.
+
+The central idea is that every individual commit in your local working copy
+becomes an individual pull request. Commits can be stacked on top of each other,
+reordered, and edited right on your computer using the standard `git` features.
+Then, run `git-grok` to sync the changes in local commits out to their
+corresponding PRs.
+
+When you want to make changes based on feedback in some PR, just go to the local
+commit in your stack, make the change ("edit a commit in the middle of the
+stack"), and rerun `git grok` to get it propagated to the PRs at GitHub.
 
 <img src="README.jpg"/>
 
-
 ## Installation
 
-```
+```bash
 git clone https://github.com/dimikot/git-grok.git
 sudo ln -s $(pwd)/git-grok/git-grok /usr/local/bin/git-grok
 brew install gh
@@ -24,47 +38,51 @@ gh auth login
 ```
 
 
-## Usage
+## Usage Examples
 
-```
+```bash
 cd your-repository
-
 git pull --rebase
-git grok
 
+# Create a PR from the topmost commit you've just made.
 touch commit1
-git add . && git commit -m "commit1"
-
+git add . && git commit -m "your commit message here"
 git grok
 
+# Create more commits on top of each other, all on top of main.
 touch commit2
-git add . && git commit -m "commit2"
+git add . && git commit -m "your commit message here"
 touch commit3
-git add . && git commit -m "commit3"
+git add . && git commit -m "your commit message here"
 touch commit4
-git add . && git commit -m "commit4"
+git add . && git commit -m "your commit message here"
 
+# This turns each individual commit on top of main into individual PRs
+# (one commit = one PR) and keeps the PRs in sync with local commits.
 git grok
-# as many times as you want
 ```
 
-Example of a managed PR: https://github.com/dimikot/git-grok/pull/1
+Now comes the beauty of stacked PRs workflow. At any time you can edit a local
+commit in the middle of the stack in your working copy and rerun `git grok` to
+update all the PRs automatically:
 
-At any time you can modify a commit in the middle of the stack and rerun `git
-grok` to update all the PRs:
-
-```
+```bash
 git rebase -i
+# Now choose a commit which you want to edit. Edit the code, then run:
+git add .
 git commit --amend
 git rebase --continue
 
+# This auto-updates all of the related PRs, so they will be in sync with
+# your local working copy.
 git grok
 ```
 
-You can also reorder the commits freely in case the one in the middle got
-accepted earlier than the previous one. Just run `git grok` afterwards.
+You can also reorder the commits freely in case a PR in the middle got accepted
+earlier than the previous one, and you want to merge it now. As usual, `git
+rebase -i`, reorder, run `git grok`.
 
-Never use `git push` again.
+With stacked PRs workflow, there is no need in branches and `git push` anymore.
 
 
 ## How to Merge
@@ -94,12 +112,11 @@ unusual, just rerun `git pull --rebase && git grok`
 (First of all, you'd better make them fast, because you're wasting the
 time/money of the entire company otherwise.)
 
-But if you cannot (my condolences), and you want to use "Squash and merge" or
-"Rebase and merge" button with stacked PRs, I have bad news for you. When you
-merge a bottom PR in the stack using any of those two options (note: the 3rd
-option, "Create a merge commit", works fine), you'll have to wait until GitHub
-Actions finish running the checks for all other PRs above. It's a GitHub
-limitation.
+But if you cannot, and you want to use "Squash and merge" or "Rebase and merge"
+button with stacked PRs, I have bad news for you. When you merge a bottom PR in
+the stack using any of those two options (note: the 3rd option, "Create a merge
+commit", works fine), you'll have to wait until GitHub Actions finish running
+the checks for all other PRs above. It's a GitHub limitation.
 
 There are 2 workarounds here though:
 
@@ -111,7 +128,7 @@ There are 2 workarounds here though:
    no other commits added on top of the main branch by someone else... then, you
    can merge the entire stack from your local machine with the following
    snippet:
-   ```
+   ```bash
    for c in $(git log --reverse --pretty=format:%h origin/main...HEAD); do
      git push origin $c:main
      sleep 5
