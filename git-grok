@@ -810,6 +810,11 @@ class Main:
     # Prints a "PR created" message.
     #
     def print_pr_created(self, *, comment: str | None = None):
+        # ATTENTION: we DO NOT print the newly created PR URL here, because it
+        # lacks the footer with links to all other PRs in the stack yet. If
+        # someone starts editing it before that footer is added (later, during
+        # the next stage), then they'll risk to lose the text! So we have no
+        # choice but to force the user to wait.
         print(f"  ── new Pull Request created" + (f" ({comment})" if comment else ""))
         sys.stdout.flush()
 
@@ -948,7 +953,7 @@ def colored(r: int, g: int, b: int, text: str):
 #
 def find_file_in_parents(file: str):
     path = os.getcwd()
-    old_path = None
+    old_path = ""
     while old_path != path:
         full = os.path.join(path, file)
         if os.path.exists(full):
