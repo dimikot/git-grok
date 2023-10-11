@@ -15,6 +15,7 @@ import traceback
 PULL_REQUEST_HEADER = "Pull Request"
 BODY_SUFFIX_TITLE = "## PRs in the Stack"
 BODY_SUFFIX_TRAIL = "(The stack is managed by git-grok.)"
+MAX_BRANCH_LEN_IN_PRINT = 36
 
 
 #
@@ -606,6 +607,8 @@ class Main:
     def print_branch_result(
         self, *, type: BranchType, branch: str, result: BranchPushResult
     ):
+        if len(branch) > MAX_BRANCH_LEN_IN_PRINT:
+            branch = branch[0:MAX_BRANCH_LEN_IN_PRINT] + "…"
         print(f"  ✅ {type}: {self.remote}/{branch} ({result})")
         sys.stdout.flush()
 
