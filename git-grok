@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-from dataclasses import dataclass
-from subprocess import check_output, CalledProcessError, Popen
-from typing import Literal, TypeVar
+
 import argparse
 import json
 import os
@@ -11,6 +9,9 @@ import shlex
 import subprocess
 import sys
 import traceback
+from dataclasses import dataclass
+from subprocess import CalledProcessError, Popen, check_output
+from typing import Literal, TypeVar
 
 PULL_REQUEST_HEADER = "Pull Request"
 BODY_SUFFIX_TITLE = "## PRs in the Stack"
