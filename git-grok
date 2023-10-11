@@ -16,7 +16,8 @@ from time import time
 from typing import Callable, Literal, TypeVar
 
 BRANCH_PREFIX = "grok/"
-PULL_REQUEST_HEADER = "Pull Request"
+PR_HEADER = "Pull Request"
+PR_HEADER_RE = rf"^\s+{PR_HEADER}: (https://\S+)(?: \((.*?)\))"
 BODY_SUFFIX_TITLE = "## PRs in the Stack"
 BODY_SUFFIX_FOOTER = (
     "(The stack is managed by [git-grok](https://github.com/dimikot/git-grok).)"
@@ -87,7 +88,7 @@ class Main:
     #
     def run(self):
         parser = argparse.ArgumentParser(
-            description="Pushes local commits as stacked PRs on GitHub and keeps them in sync."
+            description="Pushes local commits as stacked PRs on GitHub and keeps them in sync.",
         )
         parser.add_argument(
             "--in-rebase-interactive",
@@ -121,10 +122,12 @@ class Main:
         self.shell_no_throw(["git", "log", "--graph", "--decorate", "-3"])
         # Below is the real work.
         self.login = self.cache_through(
-            "gh_get_current_login", self.gh_get_current_login
+            "gh_get_current_login",
+            self.gh_get_current_login,
         )
         self.remote = self.cache_through(
-            "git_get_current_remote", self.git_get_current_remote
+            "git_get_current_remote",
+            self.git_get_current_remote,
         )
         self.remote_base_branch = self.cache_through(
             "git_get_current_remote_base_branch",
@@ -155,11 +158,15 @@ class Main:
         if prev_commit.hash != remote_commit.hash:
             prev_commit, result = self.process_commit_push_branch(commit=prev_commit)
             self.print_branch_result(
-                type="base", branch=str(prev_commit.branch), result=result
+                type="base",
+                branch=str(prev_commit.branch),
+                result=result,
             )
         else:
             self.print_branch_result(
-                type="base", branch=self.remote_base_branch, result="up-to-date"
+                type="base",
+                branch=self.remote_base_branch,
+                result="up-to-date",
             )
             prev_commit.branch = None
 
@@ -198,7 +205,9 @@ class Main:
             commit.url = url
 
             result = self.git_update_current_commit_message(
-                header_name=PULL_REQUEST_HEADER, header_value=commit.url
+                header_name=PR_HEADER,
+                header_value=commit.url,
+                header_comment=self.remote_base_branch,
             )
             if result != "up-to-date":
                 self.print_commit_message_updated()
@@ -253,7 +262,8 @@ class Main:
         # sequence is delayed till the next run, when the author has some other
         # updates to piggy-back likely.
         self.process_update_existing_prs(
-            commits=commits, commit_hashes_to_push_branch=commit_hashes_to_push_branch
+            commits=commits,
+            commit_hashes_to_push_branch=commit_hashes_to_push_branch,
         )
 
     #
@@ -287,7 +297,10 @@ class Main:
     # update the corresponding PRs.
     #
     def process_update_existing_prs(
-        self, *, commits: list[Commit], commit_hashes_to_push_branch: list[str]
+        self,
+        *,
+        commits: list[Commit],
+        commit_hashes_to_push_branch: list[str],
     ):
         # We must iterate from the oldest commit to the newest one, because
         # previous commit PR's branch becomes the next commit PR's base branch.
@@ -299,7 +312,9 @@ class Main:
                 commit, result = self.process_commit_push_branch(commit=commit)
                 if result == "pushed":
                     self.print_branch_result(
-                        type="head", branch=str(commit.branch), result=result
+                        type="head",
+                        branch=str(commit.branch),
+                        result=result,
                     )
                 commits_chronological[i] = commit
 
@@ -312,7 +327,9 @@ class Main:
                 commits=commits,
             )
             self.print_pr_result(
-                url=pr.url, result=result, review_decision=pr.review_decision
+                url=pr.url,
+                result=result,
+                review_decision=pr.review_decision,
             )
             commits_chronological[i].branch = pr.head_branch
 
@@ -321,13 +338,18 @@ class Main:
     # GitHub), or creates a new branch based on commit title and pushes it.
     #
     def process_commit_push_branch(
-        self, *, commit: Commit
+        self,
+        *,
+        commit: Commit,
     ) -> tuple[Commit, BranchPushResult]:
         if commit.url:
             pr = self.gh_get_pr(url=commit.url)
             commit.branch = pr.head_branch
         else:
-            commit.branch = self.build_branch_name(commit.title)
+            commit.branch = self.build_branch_name(
+                title=commit.title,
+                commit_hash=commit.hash,
+            )
         pushed = self.git_push_branch(branch=commit.branch, hash=commit.hash)
         return commit, pushed
 
@@ -341,7 +363,11 @@ class Main:
     # It's BTW not possible to update the head branch once PR is created.
     #
     def process_update_pr(
-        self, *, prev_commit: Commit | None, commit: Commit, commits: list[Commit]
+        self,
+        *,
+        prev_commit: Commit | None,
+        commit: Commit,
+        commits: list[Commit],
     ) -> tuple[Pr, PrUpsertResult]:
         pr_numbers: list[int] = []
         pr_number_current: int | None = None
@@ -416,7 +442,12 @@ class Main:
     # Creates a GitHub PR between two existing branches.
     #
     def gh_create_pr(
-        self, *, base_branch: str | None, head_branch: str, title: str, body: str | None
+        self,
+        *,
+        base_branch: str | None,
+        head_branch: str,
+        title: str,
+        body: str | None,
     ) -> tuple[str, PrUpsertResult]:
         if not base_branch:
             base_branch = self.remote_base_branch
@@ -447,7 +478,10 @@ class Main:
         if m:
             return m.group(1), "up-to-date"
         raise CalledProcessError(
-            returncode=returncode, cmd=cmd, output=output, stderr=stderr
+            returncode=returncode,
+            cmd=cmd,
+            output=output,
+            stderr=stderr,
         )
 
     #
@@ -565,12 +599,20 @@ class Main:
                     raise UserException(f"Can't extract commit title and description.")
                 title, description = m.group(1).strip(), m.group(2)
 
-                m = re.search(
-                    rf"^\s+{PULL_REQUEST_HEADER}: (https://\S+)",
-                    description,
-                    flags=re.M,
-                )
+                m = re.search(PR_HEADER_RE, description, flags=re.M)
                 url = m.group(1).strip() if m else None
+                expected_base_branch = m.group(2).strip() if m and m.group(2) else None
+
+                # People often times cherry-pick commits from one branch to
+                # another to e.g. ship hot-fixes in production or staging
+                # branch. In this case, we must ignore the PR URL, because along
+                # with this cherry-pick, the commit message (with existing PR
+                # URL) is copied, so we don't want to have a collision.
+                if (
+                    expected_base_branch is not None
+                    and expected_base_branch != self.remote_base_branch
+                ):
+                    url = None
             except UserException as e:
                 raise UserException(f"{str(e)} Commit:\n<<<\n{commit.strip()}\n>>")
             except BaseException as e:
@@ -635,9 +677,15 @@ class Main:
     # which is at the moment selected (activated) with interactive rebase.
     #
     def git_update_current_commit_message(
-        self, *, header_name: str, header_value: str
+        self,
+        *,
+        header_name: str,
+        header_value: str,
+        header_comment: str | None = None,
     ) -> CommitUpdateResult:
         new_header = f"{header_name}: {header_value}"
+        if header_comment:
+            new_header += f" ({header_comment})"
         message = self.shell(
             ["git", "show", "--pretty=format:%B", "--no-patch"],
             no_rstrip=True,
@@ -679,7 +727,10 @@ class Main:
             return out if no_rstrip else out.rstrip()
         finally:
             self.debug_log_shell_command(
-                cmd=cmd, out=out, took_s=time() - time_start, comment=comment
+                cmd=cmd,
+                out=out,
+                took_s=time() - time_start,
+                comment=comment,
             )
 
     #
@@ -717,9 +768,7 @@ class Main:
         finally:
             self.debug_log_shell_command(
                 cmd=cmd,
-                out="\n".join(
-                    [s for s in [stdout, stderr] if s],
-                ),
+                out="\n".join([s for s in [stdout, stderr] if s]),
                 took_s=time() - time_start,
                 comment=comment,
             )
@@ -784,20 +833,25 @@ class Main:
     #
     # Builds branch name from commit title.
     #
-    def build_branch_name(self, title: str):
+    def build_branch_name(self, *, title: str, commit_hash: str):
         branch = title
         branch = branch.strip()
         branch = re.sub(r"\[[-\w]+\]$", "", branch)
         branch = branch.lower()
         branch = re.sub(r"^\W+|\W+$", "", branch)
         branch = re.sub(r"\W+", "-", branch)
+        branch += f"-to-{self.remote_base_branch}-{commit_hash[0:4]}"
         return f"{BRANCH_PREFIX}{self.login}/{branch}"
 
     #
     # Prints a status after a branch push attempt happened.
     #
     def print_branch_result(
-        self, *, type: BranchType, branch: str, result: BranchPushResult
+        self,
+        *,
+        type: BranchType,
+        branch: str,
+        result: BranchPushResult,
     ):
         if len(branch) > MAX_BRANCH_LEN_IN_PRINT:
             branch = branch[0:MAX_BRANCH_LEN_IN_PRINT] + "…"
@@ -834,7 +888,11 @@ class Main:
     # Prints a status after a PR was created/updated on GitHub.
     #
     def print_pr_result(
-        self, *, url: str, result: PrUpsertResult, review_decision: PrReviewDecision
+        self,
+        *,
+        url: str,
+        result: PrUpsertResult,
+        review_decision: PrReviewDecision,
     ):
         icon = (
             review_decision == "APPROVED"
@@ -916,7 +974,10 @@ class Main:
             os.environ[var] = value
         else:
             self.debug_log_shell_command(
-                cmd=["printenv", var], out=value, took_s=0, comment="cache hit"
+                cmd=["printenv", var],
+                out=value,
+                took_s=0,
+                comment="cache hit",
             )
         return value
 
@@ -966,7 +1027,9 @@ def find_file_in_parents(file: str):
 # previous occurrence of the body suffix (heuristically found) with the new one.
 #
 def body_suffix_upsert(
-    body: str, pr_numbers: list[int], pr_number_current: int | None
+    body: str,
+    pr_numbers: list[int],
+    pr_number_current: int | None,
 ) -> str:
     items = [
         f"- {'➡ ' if pr_number == pr_number_current else ''}#{pr_number}"
