@@ -26,17 +26,20 @@ When you want to make changes based on feedback in some PR, just go to the local
 commit in your stack, make the change ("edit a commit in the middle of the
 stack"), and rerun `git grok` to get it propagated to the PRs at GitHub.
 
-<img src="README.jpg"/>
+<img src="media/he-grokked.jpg" width="800"/>
 
 ## Installation
 
 ```bash
 git clone https://github.com/dimikot/git-grok.git
 sudo ln -s $(pwd)/git-grok/git-grok /usr/local/bin/git-grok
+
 brew install gh
 gh auth login
 ```
 
+> [!IMPORTANT]
+> Don't forget to run `gh auth login`, it won't work otherwise.
 
 ## Usage Examples
 
@@ -84,6 +87,13 @@ rebase -i`, reorder, run `git grok`.
 
 With stacked PRs workflow, there is no need in branches and `git push` anymore.
 
+Here is how a pull request managed by `git-grok` looks like. Notice the block
+"PRs in the Stack" at the bottom of the description: it's added by the tool
+automatically, and it will also be kept in sync with your stack of local commits
+as you go. (It is also fully compatible with pull_request_template.md GitHub
+feature in case you use it.)
+
+<img src="media/stack-example.png" width="800"/>
 
 ## How to Merge
 
