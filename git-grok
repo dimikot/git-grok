@@ -165,17 +165,34 @@ class Main:
         # commit which doesn't have it. This is a heavy-weighted process which
         # is run for each commit in an interactive rebase, starting from bottom
         # to the very top.
-        commit_with_no_url = next(
-            (commit for commit in reversed(commits) if not commit.url), None
-        )
+        commit_with_no_url: Commit | None = None
+        commit_hashes_to_push_branch: list[str] = []
+        for commit in reversed(commits):
+            if not commit.url:
+                commit_with_no_url = commit
+                break
+            else:
+                commit_hashes_to_push_branch.append(commit.hash)
+
         if commit_with_no_url:
             self.process_create_missing_prs(
                 start_hash=commit_with_no_url.hash,
             )
 
-        # Update PRs for commits; they now all have URLs.
+        # Update PRs for commits; they now all have URLs. Do not push branches
+        # for commits for which we have just created missing PRs above (if any),
+        # i.e. only push branches for commit_hashes_to_push_branch. This allows
+        # to not re-trigger GitHub Actions. Notice that these branches WILL be
+        # pushed next time, because we updated the commit message (added "Pull
+        # Request" header with the just-created PR URL there which is impossible
+        # to predict in advance), i.e. the sequence is "push branch - create PR
+        # - update commit message - push branch", but the last step of this
+        # sequence is delayed till the next run, when the author has some other
+        # updates to piggy-back luckily.
         commits = self.git_get_commits()
-        self.process_update_existing_prs(commits=commits)
+        self.process_update_existing_prs(
+            commits=commits, commit_hashes_to_push_branch=commit_hashes_to_push_branch
+        )
 
     #
     # Starting from commit with hash start_hash which has no PR URL in the
@@ -198,19 +215,22 @@ class Main:
     # Iterates over the list of commits with URLs and pushes their branches to
     # update the corresponding PRs.
     #
-    def process_update_existing_prs(self, *, commits: list[Commit]):
+    def process_update_existing_prs(
+        self, *, commits: list[Commit], commit_hashes_to_push_branch: list[str]
+    ):
         # We must iterate from the oldest commit to the newest one, because
         # previous commit PR's branch becomes the next commit PR's base branch.
         commits_chronological = list(reversed(commits))
         for i, commit in enumerate(commits_chronological):
             self.print_header(f"Updating PR: {self.clean_title(commit.title)}")
 
-            commit, result = self.process_commit_push_branch(commit=commit)
-            if result == "pushed":
-                self.print_branch_result(
-                    type="head", branch=str(commit.branch), result=result
-                )
-            commits_chronological[i] = commit
+            if commit.hash in commit_hashes_to_push_branch:
+                commit, result = self.process_commit_push_branch(commit=commit)
+                if result == "pushed":
+                    self.print_branch_result(
+                        type="head", branch=str(commit.branch), result=result
+                    )
+                commits_chronological[i] = commit
 
             assert (
                 commit.url is not None
