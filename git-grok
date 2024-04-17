@@ -12,12 +12,16 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime
 from subprocess import CalledProcessError, Popen, check_output
+from threading import Thread, current_thread, main_thread
 from time import time
-from typing import Callable, Literal, TypeVar
+from typing import Callable, Literal, TypeVar, Generic, ParamSpec
 
 BRANCH_PREFIX = "grok/"
 PR_HEADER = "Pull Request"
 PR_HEADER_RE = rf"^\s+{PR_HEADER}: (https://\S+)(?: \((.*?)\))?"
+MIDDLE_PR_LABEL = "git-grok-middle-pr"
+MIDDLE_PR_LABEL_DESCRIPTION = "This PR is in the middle of the stack."
+MIDDLE_PR_LABEL_COLOR = "CCCCCC"
 BODY_SUFFIX_TITLE = "## PRs in the Stack"
 BODY_SUFFIX_FOOTER = (
     "(The stack is managed by [git-grok](https://github.com/dimikot/git-grok).)"
@@ -54,7 +58,7 @@ class Commit:
 #
 @dataclass
 class Pr:
-    number: str
+    number: int
     title: str
     body: str
     base_branch: str
@@ -63,6 +67,7 @@ class Pr:
     review_decision: PrReviewDecision
     state: Literal["OPEN", "CLOSED", "MERGED"]
     auto_merge_status: Literal["ENABLED", "DISABLED", "UNKNOWN"]
+    labels: list[str]
 
 
 BranchPushResult = Literal["pushed", "up-to-date"]
@@ -76,6 +81,7 @@ PrReviewDecision = Literal["APPROVED", "REVIEW_REQUIRED", "CHANGES_REQUESTED"]
 CommitUpdateResult = Literal["updated", "up-to-date"]
 
 T = TypeVar("T")
+P = ParamSpec("P")
 
 
 class Main:
@@ -197,9 +203,11 @@ class Main:
             )
             if result != "up-to-date":
                 self.print_pr_created(
-                    comment="instead of accidentally merged"
-                    if new_pr_fixes_accidentally_merged_one
-                    else None
+                    comment=(
+                        "instead of accidentally merged"
+                        if new_pr_fixes_accidentally_merged_one
+                        else None
+                    )
                 )
             commit.url = url
 
@@ -224,7 +232,22 @@ class Main:
             )
             return
 
-        self.process_validate_commits(commits=commits)
+        task_upsert_labels = Task(self.gh_upsert_labels)
+        task_validate_commits = Task(self.process_validate_commits, commits=commits)
+        tasks_gh_get_pr = (
+            dict(
+                [
+                    (url, Task(self.gh_get_pr, url=url))
+                    for url in (c.url for c in reversed(commits) if c.url)
+                ]
+            )
+            if not self.debug_force_push_branches
+            else {}
+        )
+
+        task_validate_commits.wait()
+        task_upsert_labels.wait()
+        prs_by_url = dict((url, task.wait()) for (url, task) in tasks_gh_get_pr.items())
 
         # Inject "Pull Request" URL to commit descriptions starting from the
         # commit which doesn't have it. This is a heavy-weighted process which
@@ -233,11 +256,11 @@ class Main:
         commit_with_no_url: Commit | None = None
         commit_hashes_to_push_branch: list[str] = []
         for commit in reversed(commits):
-            if not commit.url or self.debug_force_push_branches:
+            if self.debug_force_push_branches or not commit.url:
                 commit_with_no_url = commit
                 break
             else:
-                pr = self.gh_get_pr(url=commit.url)
+                pr = prs_by_url[commit.url]
                 if pr.state == "MERGED" and pr.base_branch.startswith(BRANCH_PREFIX):
                     commit_with_no_url = commit
                     break
@@ -380,6 +403,7 @@ class Main:
     #   merged into the remote, so the the beginning of the stack started
     #   pointing not to a branch, but to a remote tip)
     # - full stack list in the description
+    # - git-grok related labels
     #
     # It's BTW not possible to update the head branch once PR is created.
     #
@@ -414,19 +438,19 @@ class Main:
     #
     # Returns current GitHub login.
     #
-    def gh_get_current_login(self):
+    def gh_get_current_login(self) -> str:
         return self.shell(["gh", "api", "user", "--jq", ".login"])
 
     #
     # Returns current git folder remote (most often "origin").
     #
-    def git_get_current_remote(self):
+    def git_get_current_remote(self) -> str:
         return self.shell(["git", "remote", "show"])
 
     #
     # Returns the current remote branch name on GitHub.
     #
-    def git_get_current_remote_base_branch(self):
+    def git_get_current_remote_base_branch(self) -> str:
         branch = self.shell(["git", "branch", "--show-current"])
         if not branch:
             path = ".git/rebase-merge/head-name"
@@ -459,6 +483,24 @@ class Main:
             ]
         )
         return tuple(json.loads(out_str))
+
+    #
+    # Pre-creates git-grok related labels.
+    #
+    def gh_upsert_labels(self):
+        self.shell(
+            [
+                "gh",
+                "label",
+                "create",
+                MIDDLE_PR_LABEL,
+                "-d",
+                MIDDLE_PR_LABEL_DESCRIPTION,
+                "-c",
+                MIDDLE_PR_LABEL_COLOR,
+                "--force",
+            ],
+        )
 
     #
     # Creates a GitHub PR between two existing branches.
@@ -522,7 +564,17 @@ class Main:
 
         pr = self.gh_get_pr(url=url)
         new_body = body_suffix_upsert(pr.body, pr_numbers, pr_number_current)
-        if pr.base_branch == base_branch and pr.body == new_body and pr.state == "OPEN":
+        is_middle_pr = len(pr_numbers) > 0 and pr.number not in (
+            pr_numbers[0],
+            pr_numbers[-1],
+        )
+
+        if (
+            pr.base_branch == base_branch
+            and pr.body == new_body
+            and pr.state == "OPEN"
+            and (MIDDLE_PR_LABEL in pr.labels) == is_middle_pr
+        ):
             return pr, "up-to-date"
 
         self.cache_clean(url)
@@ -551,6 +603,15 @@ class Main:
                 url,
                 "--base",
                 base_branch,
+                *(
+                    ["--add-label", MIDDLE_PR_LABEL]
+                    if is_middle_pr and MIDDLE_PR_LABEL not in pr.labels
+                    else (
+                        ["--remove-label", MIDDLE_PR_LABEL]
+                        if not is_middle_pr and MIDDLE_PR_LABEL in pr.labels
+                        else []
+                    )
+                ),
                 "--body-file",
                 "-",
             ],
@@ -564,7 +625,7 @@ class Main:
     #
     # Reads PR info from GitHub.
     #
-    def gh_get_pr(self, *, url: str):
+    def gh_get_pr(self, *, url: str) -> Pr:
         out_str = self.cache_through(
             url,
             lambda: self.shell(
@@ -574,13 +635,13 @@ class Main:
                     "view",
                     url,
                     "--json",
-                    "number,title,body,baseRefName,headRefName,url,reviewDecision,state",
+                    "number,title,body,baseRefName,headRefName,url,reviewDecision,state,labels",
                 ],
             ),
         )
         value = json.loads(out_str)
         return Pr(
-            number=value["number"],
+            number=int(value["number"]),
             title=value["title"],
             body=value["body"],
             base_branch=re.sub(r"^refs/heads/", "", value["baseRefName"]),
@@ -589,6 +650,7 @@ class Main:
             review_decision=value["reviewDecision"],
             state=value["state"],
             auto_merge_status="UNKNOWN",
+            labels=[label["name"] for label in value["labels"]],
         )
 
     #
@@ -618,8 +680,11 @@ class Main:
                         name=field_name,
                         url=commit.url,
                         clause=f"  {field_name}: pullRequest(number: {pr_number}) "
-                        + "{ number, title, body, baseRefName, headRefName, url, reviewDecision, state, "
-                        + "autoMergeRequest { enabledAt } }\n",
+                        + "{ "
+                        + "number, title, body, baseRefName, headRefName, url, reviewDecision, state, "
+                        + "autoMergeRequest { enabledAt }, "
+                        + "labels(first: 100) { nodes { name } }"
+                        + " }\n",
                     )
                 )
             else:
@@ -663,7 +728,7 @@ class Main:
             if value:
                 prs.append(
                     Pr(
-                        number=value["number"],
+                        number=int(value["number"]),
                         title=value["title"],
                         body=value["body"],
                         base_branch=re.sub(r"^refs/heads/", "", value["baseRefName"]),
@@ -671,9 +736,18 @@ class Main:
                         url=value["url"],
                         review_decision=value["reviewDecision"],
                         state=value["state"],
-                        auto_merge_status="ENABLED"
-                        if value["autoMergeRequest"]
-                        else "UNKNOWN",
+                        auto_merge_status=(
+                            "ENABLED" if value["autoMergeRequest"] else "UNKNOWN"
+                        ),
+                        labels=(
+                            [
+                                label["name"]
+                                for label in value["labels"]["nodes"]
+                                if label
+                            ]
+                            if value["labels"] and value["labels"]["nodes"]
+                            else []
+                        ),
                     )
                 )
             else:
@@ -690,7 +764,7 @@ class Main:
         latest_ref: str | None = None,
         earliest_ref: str | None = None,
         count_back_in_time: int | None = None,
-    ):
+    ) -> list[Commit]:
         if latest_ref is None:
             latest_ref = "HEAD"
         if earliest_ref is None:
@@ -944,7 +1018,7 @@ class Main:
     #
     # Cleans a title from useless prefix/suffix.
     #
-    def clean_title(self, title: str):
+    def clean_title(self, title: str) -> str:
         title = title.strip()
         title = re.sub(r"^\w+[()\[\]\w]*:\s+", "", title)
         title = re.sub(r"\[[-\w]+\]$", "", title)
@@ -955,7 +1029,7 @@ class Main:
     #
     # Builds branch name from commit title.
     #
-    def build_branch_name(self, *, title: str, commit_hash: str):
+    def build_branch_name(self, *, title: str, commit_hash: str) -> str:
         branch = title
         branch = branch.strip()
         branch = re.sub(r"\[[-\w]+\]$", "", branch)
@@ -1051,6 +1125,11 @@ class Main:
                 "$ "
                 + shlex.join(cmd).strip()
                 + (f" # took {int(took_s * 1000)} ms" if took_s else "")
+                + (
+                    f", ran in a parallel thread"
+                    if current_thread() is not main_thread()
+                    else ""
+                )
                 + (f" # {comment}" if comment else ""),
             )
         )
@@ -1088,7 +1167,7 @@ class Main:
     # Caches the return value of a function in environment and returns it next time
     # it's requested.
     #
-    def cache_through(self, key: str, func: Callable[[], str]):
+    def cache_through(self, key: str, func: Callable[[], str]) -> str:
         var = f"{INTERNAL_ENV_VAR_PREFIX}:{key}"
         value = os.environ.get(var, None)
         if value is None:
@@ -1124,7 +1203,7 @@ def chunk(lst: list[T], n: int) -> list[list[T]]:
 #
 # Returns a colored text.
 #
-def colored(r: int, g: int, b: int, text: str):
+def colored(r: int, g: int, b: int, text: str) -> str:
     return f"\033[38;2;{r};{g};{b}m{text}\033[0m"
 
 
@@ -1132,7 +1211,7 @@ def colored(r: int, g: int, b: int, text: str):
 # Traverse the filesystem from the current directory to root trying to find a
 # matching relative file path in parent directories.
 #
-def find_file_in_parents(file: str):
+def find_file_in_parents(file: str) -> str | None:
     path = os.getcwd()
     old_path = ""
     while old_path != path:
@@ -1163,6 +1242,33 @@ def body_suffix_upsert(
     if re.search(BODY_SUFFIX_RE, body, flags=re.M | re.I | re.X):
         return re.sub(BODY_SUFFIX_RE, suffix, body, flags=re.M | re.I | re.X)
     return body.rstrip() + "\n\n" + suffix
+
+
+#
+# Runs a function in a separate thread. To wait for its termination and get its
+# return value, call wait() method. If the function raises an exception, it will
+# be re-raised in the calling thread.
+#
+class Task(Generic[T, P]):
+    _result: T
+    _error: BaseException | None = None
+    _thread: Thread
+
+    def __init__(self, target: Callable[P, T], *args: P.args, **kwargs: P.kwargs):
+        def target_wrapper():
+            try:
+                self._result = target(*args, **kwargs)
+            except BaseException as e:
+                self._error = e
+
+        self._thread = Thread(target=target_wrapper)
+        self._thread.start()
+
+    def wait(self) -> T:
+        self._thread.join()
+        if self._error:
+            raise self._error
+        return self._result
 
 
 #
