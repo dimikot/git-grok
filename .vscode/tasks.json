@@ -1,0 +1,20 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "git grok: push local commits as individual PRs",
+      "detail": "Install git-grok first: https://github.com/dimikot/git-grok",
+      "type": "shell",
+      "command": "git grok",
+      "problemMatcher": [],
+      "hide": false
+    },
+    {
+      "label": "git rebase --interactive",
+      "detail": "Opens a UI for interactive rebase (install \"Git rebase shortcuts\" extension).",
+      "type": "shell",
+      "command": "GIT_EDITOR=\"code --wait\" git rebase -i",
+      "problemMatcher": []
+    }
+  ]
+}

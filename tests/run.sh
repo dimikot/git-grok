@@ -1,4 +1,5 @@
 #!/bin/bash
-cd $(dirname "${BASH_SOURCE[0]}")
+set -e -o pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
 
-python3 -B -m unittest discover -s . -p '*_test.py' $@
+python3 -B -m unittest discover -s . -p '*_test.py' "$@"
