@@ -14,7 +14,7 @@ from datetime import datetime
 from subprocess import CalledProcessError, Popen, check_output
 from threading import Thread, current_thread, main_thread
 from time import time
-from typing import Callable, Literal, TypeVar, Generic, ParamSpec
+from typing import Callable, Literal, TypeVar, Generic
 
 BRANCH_PREFIX = "grok/"
 PR_HEADER = "Pull Request"
@@ -81,7 +81,6 @@ PrReviewDecision = Literal["APPROVED", "REVIEW_REQUIRED", "CHANGES_REQUESTED"]
 CommitUpdateResult = Literal["updated", "up-to-date"]
 
 T = TypeVar("T")
-P = ParamSpec("P")
 
 
 class Main:
@@ -1249,12 +1248,12 @@ def body_suffix_upsert(
 # return value, call wait() method. If the function raises an exception, it will
 # be re-raised in the calling thread.
 #
-class Task(Generic[T, P]):
+class Task(Generic[T]):
     _result: T
     _error: BaseException | None = None
     _thread: Thread
 
-    def __init__(self, target: Callable[P, T], *args: P.args, **kwargs: P.kwargs):
+    def __init__(self, target: Callable[..., T], *args: ..., **kwargs: ...):
         def target_wrapper():
             try:
                 self._result = target(*args, **kwargs)
