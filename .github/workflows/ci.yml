@@ -8,6 +8,9 @@ on:
     branches:
       - main
 
+env:
+  GIT_GROK_TEST_GH_TOKEN: ${{ secrets.GIT_GROK_TEST_GH_TOKEN }}
+
 jobs:
   test:
     runs-on: ubuntu-latest

@@ -36,6 +36,7 @@ MAX_TITLE_LEN_IN_PRINT = 50
 TMP_BODY_FILE = "/tmp/git-grok.body"
 INTERNAL_ENV_VAR_PREFIX = "GIT_GROK"
 INTERNAL_IN_REBASE_INTERACTIVE_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_in_rebase_interactive"
+INTERNAL_SKIP_UPDATE_PRS_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_skip_update_prs"
 DEBUG_FILE = "/tmp/git-grok.log"
 DEBUG_COLOR_GRAY_1 = (128, 128, 128)
 DEBUG_COLOR_GRAY_2 = (92, 92, 92)
@@ -312,10 +313,11 @@ class Main:
         # - update commit message - push branch", but the last step of this
         # sequence is delayed till the next run, when the author has some other
         # updates to piggy-back likely.
-        self.process_update_existing_prs(
-            commits=commits,
-            commit_hashes_to_push_branch=commit_hashes_to_push_branch,
-        )
+        if not os.environ.get(INTERNAL_SKIP_UPDATE_PRS_VAR):
+            self.process_update_existing_prs(
+                commits=commits,
+                commit_hashes_to_push_branch=commit_hashes_to_push_branch,
+            )
 
     #
     # Checks that the tool can process this stack of commits at all.
@@ -1235,7 +1237,7 @@ class Main:
     #
     def cache_through(self, key: str, func: Callable[[], str]) -> str:
         var = f"{INTERNAL_ENV_VAR_PREFIX}:{key}"
-        value = os.environ.get(var, None)
+        value = os.environ.get(var)
         if value is None:
             value = func()
             os.environ[var] = value

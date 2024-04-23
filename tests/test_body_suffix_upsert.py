@@ -1,9 +1,9 @@
 __import__("sys").dont_write_bytecode = True
-import unittest
 from helpers import git_grok, dedent
+from unittest import TestCase, main
 
 
-class Test(unittest.TestCase):
+class Test(TestCase):
     def test_idempotent(self):
         self.assertEqual(
             git_grok.body_suffix_upsert(
@@ -151,7 +151,7 @@ class Test(unittest.TestCase):
                 f"""
                     ## PRs in the Stack
                     - #11
-                    
+
                     - ➡ #22 something else
                     - #33
 
@@ -204,4 +204,4 @@ class Test(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()

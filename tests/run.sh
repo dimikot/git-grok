@@ -2,4 +2,10 @@
 set -e -o pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-python3 -B -m unittest discover -s . -p '*_test.py' "$@"
+rm -f /tmp/git-grok.log
+
+if ! python3 -B -m unittest discover -v -s . -p 'test_*.py' "$@"; then
+  echo
+  cat /tmp/git-grok.log
+  exit 1
+fi
