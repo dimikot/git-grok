@@ -10,6 +10,7 @@ import sys
 import traceback
 from dataclasses import dataclass
 from datetime import datetime
+from itertools import dropwhile
 from subprocess import CalledProcessError, Popen, check_output
 from threading import Thread, current_thread, main_thread
 from time import time
@@ -69,6 +70,29 @@ class Pr:
     labels: list[str]
 
 
+#
+# Some data passed from the main process to each individual child process call
+# within "git rebase -i", for each commit in the stack.
+#
+@dataclass
+class InRebaseInteractiveData:
+    commit_index_one_based: int
+    total_commits_in_stack: int
+
+    @staticmethod
+    def parse(str: str) -> InRebaseInteractiveData | None:
+        match = re.match(r"^(\d+)/(\d+)$", str)
+        if match:
+            return InRebaseInteractiveData(
+                commit_index_one_based=int(match.group(1)),
+                total_commits_in_stack=int(match.group(2)),
+            )
+        return None
+
+    def stringify(self) -> str:
+        return f"{self.commit_index_one_based}/{self.total_commits_in_stack}"
+
+
 BranchPushResult = Literal["pushed", "up-to-date"]
 
 BranchType = Literal["base", "head"]
@@ -83,7 +107,6 @@ T = TypeVar("T")
 
 
 class Main:
-    in_rebase_interactive: bool = False
     debug: bool = False
     debug_force_push_branches: bool = False
     login: str
@@ -111,13 +134,14 @@ class Main:
         )
         args = parser.parse_args()
 
-        self.in_rebase_interactive = bool(
-            os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR, None)
+        in_rebase_interactive = InRebaseInteractiveData.parse(
+            os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR, "")
         )
+
         self.debug = args.debug
         self.debug_force_push_branches = args.debug_force_push_branches
 
-        if not self.in_rebase_interactive:
+        if not in_rebase_interactive:
             self.self_update()
 
         # For debug purposes only.
@@ -136,8 +160,8 @@ class Main:
             "git_get_current_remote_base_branch",
             self.git_get_current_remote_base_branch,
         )
-        if self.in_rebase_interactive:
-            self.run_in_rebase_interactive()
+        if in_rebase_interactive:
+            self.run_in_rebase_interactive(data=in_rebase_interactive)
         else:
             self.run_all()
         print("")
@@ -146,7 +170,7 @@ class Main:
     # Runs the sync for only the top commit. This is an internal command which
     # is used during interactive rebase.
     #
-    def run_in_rebase_interactive(self):
+    def run_in_rebase_interactive(self, *, data: InRebaseInteractiveData):
         remote_commit = self.git_get_commits(
             latest_ref=f"remotes/{self.remote}/{self.remote_base_branch}",
             count_back_in_time=1,
@@ -198,6 +222,10 @@ class Main:
                 head_branch=commit.branch,
                 title=new_pr_title,
                 body=new_pr_body,
+                is_middle_pr=(
+                    data.commit_index_one_based != 1
+                    and data.commit_index_one_based != data.total_commits_in_stack
+                ),
             )
             if result != "up-to-date":
                 self.print_pr_created(
@@ -269,7 +297,8 @@ class Main:
         # Create missing PRs and amend their messages (via rebase interactive).
         if commit_with_no_url:
             self.process_create_missing_prs(
-                start_hash=commit_with_no_url.hash,
+                earliest_hash=commit_with_no_url.hash,
+                commits=commits,
             )
             commits = self.git_get_commits()
 
@@ -305,12 +334,23 @@ class Main:
                     )
 
     #
-    # Starting from commit with hash start_hash which has no PR URL in the
+    # Starting from commit with hash earliest_hash which has no PR URL in the
     # description, creates the missing PRs and updates commits descriptions with
     # the returned URL.
     #
-    def process_create_missing_prs(self, *, start_hash: str):
+    def process_create_missing_prs(
+        self,
+        *,
+        earliest_hash: str,
+        commits: list[Commit],
+    ):
         try:
+            commits_to_rebase = list(
+                dropwhile(lambda c: c.hash != earliest_hash, reversed(commits))
+            )
+            assert (
+                commits_to_rebase
+            ), f"earliest_hash={earliest_hash} must be in commits={commits}"
             cmd = shlex.join(
                 [
                     __file__,
@@ -322,13 +362,29 @@ class Main:
                     ),
                 ]
             )
+            todo = "".join(
+                [
+                    f"pick {c.hash} {c.title}\n"
+                    + f"exec {INTERNAL_IN_REBASE_INTERACTIVE_VAR}="
+                    + shlex.quote(
+                        InRebaseInteractiveData(
+                            commit_index_one_based=(
+                                len(commits) - len(commits_to_rebase) + i + 1
+                            ),
+                            total_commits_in_stack=len(commits),
+                        ).stringify()
+                    )
+                    + f" {cmd}\n"
+                    for [i, c] in enumerate(commits_to_rebase)
+                ]
+            )
             self.git_rebase_interactive_exec(
-                cmd=f"{INTERNAL_IN_REBASE_INTERACTIVE_VAR}=1 {cmd}",
-                start_hash=start_hash,
+                earliest_hash=earliest_hash,
                 skip_res=[
                     r"^You can fix the problem, and then run$",
                     r"^\s*git rebase --continue$",
                 ],
+                todo=f"\n{todo}",
             )
         except (CalledProcessError, KeyboardInterrupt) as e:
             self.shell_no_throw(["git", "rebase", "--abort"])
@@ -418,11 +474,11 @@ class Main:
             assert (
                 c.url is not None
             ), f"commit {c.hash} PR URL is expected to be in the message at this point"
-            m = re.search(r"/(\d+)$", c.url)
-            if m:
-                pr_numbers.append(int(m.group(1)))
+            match = re.search(r"/(\d+)$", c.url)
+            if match:
+                pr_numbers.append(int(match.group(1)))
                 if c.hash == commit.hash:
-                    pr_number_current = int(m.group(1))
+                    pr_number_current = int(match.group(1))
         assert (
             commit.url is not None
         ), f"commit {commit.hash} PR URL is expected to be in the message at this point"
@@ -501,7 +557,9 @@ class Main:
         )
 
     #
-    # Creates a GitHub PR between two existing branches.
+    # Creates a GitHub PR between two existing branches. The description of the
+    # new PR will NOT include the body suffix with the list of all PRs in the
+    # stack, since we don't know all URLs in this list yet.
     #
     def gh_create_pr(
         self,
@@ -510,6 +568,7 @@ class Main:
         head_branch: str,
         title: str,
         body: str | None,
+        is_middle_pr: bool,
     ) -> tuple[str, PrUpsertResult]:
         if not base_branch:
             base_branch = self.remote_base_branch
@@ -529,6 +588,7 @@ class Main:
             base_branch,
             "--head",
             head_branch,
+            *(["--label", MIDDLE_PR_LABEL] if is_middle_pr else []),
             "--title",
             title,
             *(["--body-file", body_file] if body_file else ["--body", ""]),
@@ -845,9 +905,9 @@ class Main:
     def git_rebase_interactive_exec(
         self,
         *,
-        cmd: str,
-        start_hash: str,
+        earliest_hash: str,
         skip_res: list[str] = [],
+        todo: str,
     ):
         self.shell_passthrough(
             [
@@ -855,11 +915,9 @@ class Main:
                 "rebase",
                 "--quiet",
                 "--interactive",
-                "--exec",
-                cmd,
-                f"{start_hash}^",
+                f"{earliest_hash}^",
             ],
-            env={"GIT_EDITOR": "true"},
+            env={"GIT_SEQUENCE_EDITOR": f"echo {shlex.quote(todo)} >"},
             skip_res=[r"Executing: ", *skip_res],
         )
 
@@ -922,6 +980,7 @@ class Main:
         finally:
             self.debug_log_shell_command(
                 cmd=cmd,
+                env=env,
                 out=out,
                 took_s=time() - time_start,
                 comment=comment,
@@ -962,6 +1021,7 @@ class Main:
         finally:
             self.debug_log_shell_command(
                 cmd=cmd,
+                env=env,
                 out="\n".join([s for s in [stdout, stderr] if s]),
                 took_s=time() - time_start,
                 comment=comment,
@@ -979,7 +1039,9 @@ class Main:
         comment: str | None = None,
     ):
         out = ""
-        self.debug_log_shell_command(cmd=cmd, out="", took_s=0, comment=comment)
+        self.debug_log_shell_command(
+            cmd=cmd, env=env, out="", took_s=0, comment=comment
+        )
         with Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -1112,6 +1174,7 @@ class Main:
         self,
         *,
         cmd: list[str],
+        env: dict[str, str] | None,
         out: str | None,
         took_s: float,
         comment: str | None = None,
@@ -1121,6 +1184,11 @@ class Main:
             (
                 DEBUG_COLOR_GRAY_1,
                 "$ "
+                + (
+                    " ".join([f"{k}={shlex.quote(v)}" for (k, v) in env.items()]) + " "
+                    if env
+                    else ""
+                )
                 + shlex.join(cmd).strip()
                 + (f" # took {int(took_s * 1000)} ms" if took_s else "")
                 + (
@@ -1144,7 +1212,7 @@ class Main:
                 )
             )
 
-        if self.in_rebase_interactive:
+        if os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR):
             rows = [(row[0], re.sub(r"^", "> ", row[1], flags=re.M)) for row in rows]
 
         try:
@@ -1174,6 +1242,7 @@ class Main:
         else:
             self.debug_log_shell_command(
                 cmd=["printenv", var],
+                env=None,
                 out=value,
                 took_s=0,
                 comment="cache hit",
