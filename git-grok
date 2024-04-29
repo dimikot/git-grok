@@ -501,7 +501,22 @@ class Main:
     # Returns current git folder remote (most often "origin").
     #
     def git_get_current_remote(self) -> str:
-        return self.shell(["git", "remote", "show"])
+        [_, symbolic_ref, _] = self.shell_no_throw(
+            ["git", "symbolic-ref", "-q", "HEAD"]
+        )
+        if not symbolic_ref:
+            raise UserException(
+                'To run git-grok, you must be on a branch. Check your "git status".'
+            )
+        upstream = self.shell(
+            ["git", "for-each-ref", "--format=%(upstream:short)", symbolic_ref]
+        )
+        m = re.match(r"([^/]+)/.+$", upstream)
+        if not m:
+            raise UserException(
+                f'Cannot extract remote from upstream "{upstream}" of symbolic ref "{symbolic_ref}".'
+            )
+        return m.group(1)
 
     #
     # Returns the current remote branch name on GitHub.
@@ -969,6 +984,7 @@ class Main:
         comment: str | None = None,
     ) -> str:
         out = None
+        returncode = 0
         time_start = time()
         try:
             out = check_output(
@@ -979,11 +995,15 @@ class Main:
                 env={**os.environ, **env} if env else None,
             )
             return out if no_rstrip else out.rstrip()
+        except CalledProcessError as e:
+            returncode = e.returncode
+            raise
         finally:
             self.debug_log_shell_command(
                 cmd=cmd,
                 env=env,
                 out=out,
+                returncode=returncode,
                 took_s=time() - time_start,
                 comment=comment,
             )
@@ -1002,6 +1022,7 @@ class Main:
     ) -> tuple[int, str, str]:
         stdout = ""
         stderr = ""
+        returncode = None
         time_start = time()
         try:
             proc = Popen(
@@ -1015,6 +1036,7 @@ class Main:
             if not no_rstrip:
                 stdout = stdout.rstrip()
                 stderr = stderr.rstrip()
+            returncode = proc.returncode
             return (
                 proc.returncode,
                 stdout,
@@ -1025,6 +1047,7 @@ class Main:
                 cmd=cmd,
                 env=env,
                 out="\n".join([s for s in [stdout, stderr] if s]),
+                returncode=returncode,
                 took_s=time() - time_start,
                 comment=comment,
             )
@@ -1042,7 +1065,12 @@ class Main:
     ):
         out = ""
         self.debug_log_shell_command(
-            cmd=cmd, env=env, out="", took_s=0, comment=comment
+            cmd=cmd,
+            env=env,
+            out="",
+            returncode=None,
+            took_s=0,
+            comment=comment,
         )
         with Popen(
             cmd,
@@ -1178,6 +1206,7 @@ class Main:
         cmd: list[str],
         env: dict[str, str] | None,
         out: str | None,
+        returncode: int | None,
         took_s: float,
         comment: str | None = None,
     ):
@@ -1193,8 +1222,9 @@ class Main:
                 )
                 + shlex.join(cmd).strip()
                 + (f" # took {int(took_s * 1000)} ms" if took_s else "")
+                + (f" # returncode={returncode}" if returncode else "")
                 + (
-                    f", ran in a parallel thread"
+                    f" # ran in a parallel thread"
                     if current_thread() is not main_thread()
                     else ""
                 )
@@ -1246,6 +1276,7 @@ class Main:
                 cmd=["printenv", var],
                 env=None,
                 out=value,
+                returncode=None,
                 took_s=0,
                 comment="cache hit",
             )
