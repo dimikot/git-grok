@@ -9,6 +9,7 @@ from os.path import basename, dirname, realpath
 from platform import python_version
 from shutil import rmtree
 from subprocess import Popen, check_output, CalledProcessError, STDOUT, PIPE
+from typing import Literal
 from unittest import TestCase
 
 GIT_GROK_PATH = dirname(dirname(realpath(__file__))) + "/git-grok"
@@ -42,14 +43,18 @@ def check_output_x(*cmd: str) -> str:
         ) from None
 
 
-def git_init_and_cd_to_test_dir(*, dir: str, initial_branch: str):
+def git_init_and_cd_to_test_dir(
+    *,
+    dir: str,
+    initial_branch: str,
+    method: Literal["push.default", "set-upstream"],
+):
     rmtree(dir, ignore_errors=True)
     mkdir(dir)
     chdir(dir)
     check_output_x("git", "init", f"--initial-branch={initial_branch}")
     check_output_x("git", "config", "user.name", "tests")
     check_output_x("git", "config", "user.email", "tests@example.com")
-    check_output_x("git", "config", "push.default", "current")
     check_output_x(
         "git",
         "remote",
@@ -73,7 +78,14 @@ def git_init_and_cd_to_test_dir(*, dir: str, initial_branch: str):
         environ["GH_TOKEN"] = token
 
     check_output_x("git", "commit", "--allow-empty", "-m", "Initial commit")
-    git_push()
+
+    if method == "push.default":
+        check_output_x("git", "config", "push.default", "current")
+        check_output_x("git", "push", "-f", TEST_REMOTE)
+    elif method == "set-upstream":
+        check_output_x(
+            "git", "push", "-f", "--set-upstream", TEST_REMOTE, initial_branch
+        )
 
     check_output_x("git", "fetch")
     branches = [
@@ -111,7 +123,7 @@ def git_add_commit(msg: str):
 
 
 def git_push():
-    check_output_x("git", "push", "-f", TEST_REMOTE)
+    check_output_x("git", "push", "-f", "--set-upstream", TEST_REMOTE)
 
 
 def git_get_prs(branch: str) -> str:
@@ -171,12 +183,20 @@ class TestCaseWithEmptyTestRepo(TestCase):
         )
         self.cwd = getcwd()
         self.initial_branch = f"{prefix}tests{python_version()}"
-        git_init_and_cd_to_test_dir(
-            dir="/tmp/git-grok-tests", initial_branch=self.initial_branch
-        )
 
     def tearDown(self):
         chdir(self.cwd)
+
+    def git_init_and_cd_to_test_dir(
+        self,
+        *,
+        method: Literal["push.default", "set-upstream"] = "set-upstream",
+    ):
+        git_init_and_cd_to_test_dir(
+            dir="/tmp/git-grok-tests",
+            initial_branch=self.initial_branch,
+            method=method,
+        )
 
 
 git_grok = import_path(GIT_GROK_PATH)
