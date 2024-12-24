@@ -13,7 +13,7 @@
       "label": "git rebase --interactive",
       "detail": "Opens a UI for interactive rebase (install \"Git rebase shortcuts\" extension).",
       "type": "shell",
-      "command": "GIT_EDITOR=\"code --wait\" git rebase -i",
+      "command": "GIT_EDITOR=\"$(which cursor >/dev/null 2>/dev/null && echo cursor || echo code) --wait\" git rebase -i",
       "problemMatcher": []
     }
   ]

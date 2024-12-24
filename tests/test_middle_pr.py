@@ -23,7 +23,7 @@ class Test(TestCaseWithEmptyTestRepo):
 
         run_git_grok(skip_update_prs=True)
         self.assertEqual(
-            git_get_prs(self.branch),
+            git_get_prs(self.initial_branch),
             dedent(
                 """
                 commit01#
@@ -36,7 +36,7 @@ class Test(TestCaseWithEmptyTestRepo):
 
         run_git_grok()
         self.assertEqual(
-            git_get_prs(self.branch),
+            git_get_prs(self.initial_branch),
             dedent(
                 """
                 commit01#
@@ -52,7 +52,7 @@ class Test(TestCaseWithEmptyTestRepo):
 
         run_git_grok()
         self.assertEqual(
-            git_get_prs(self.branch),
+            git_get_prs(self.initial_branch),
             dedent(
                 """
                 commit01#

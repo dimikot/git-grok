@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import shlex
 import subprocess
@@ -13,7 +14,7 @@ from datetime import datetime
 from itertools import dropwhile
 from subprocess import CalledProcessError, Popen, check_output
 from threading import Thread, current_thread, main_thread
-from time import time
+from time import time, sleep
 from typing import Callable, Literal, TypeVar, Generic
 
 BRANCH_PREFIX = "grok/"
@@ -31,8 +32,8 @@ BODY_SUFFIX_RE = (
     + r"( (\s*(\n|\Z))* (- \s* [^\n]+ (\n|\Z)) )*"
     + r"( (\s*(\n|\Z))* [^\n]+ \bgit-grok\b [^\n]+ (\n|\Z) )?"
 )
-MAX_BRANCH_LEN_IN_PRINT = 36
-MAX_TITLE_LEN_IN_PRINT = 50
+MIN_BRANCH_LEN_IN_PRINT = 36
+MIN_TITLE_LEN_IN_PRINT = 36
 TMP_BODY_FILE = "/tmp/git-grok.body"
 INTERNAL_ENV_VAR_PREFIX = "GIT_GROK"
 INTERNAL_IN_REBASE_INTERACTIVE_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_in_rebase_interactive"
@@ -40,6 +41,18 @@ INTERNAL_SKIP_UPDATE_PRS_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_skip_update_prs"
 DEBUG_FILE = "/tmp/git-grok.log"
 DEBUG_COLOR_GRAY_1 = (128, 128, 128)
 DEBUG_COLOR_GRAY_2 = (92, 92, 92)
+
+try:
+    TERMINAL_SIZE = os.get_terminal_size()
+    os.environ["COLUMNS"] = str(TERMINAL_SIZE.columns)
+    os.environ["LINES"] = str(TERMINAL_SIZE.lines)
+except:
+    TERMINAL_SIZE = os.terminal_size(  # type: ignore
+        (
+            int(os.environ.get("COLUMNS", "512")),
+            int(os.environ.get("LINES", "40")),
+        )
+    )
 
 
 #
@@ -118,6 +131,8 @@ class Main:
     # Main entry point.
     #
     def run(self):
+        self.debug_log_argv()
+
         parser = argparse.ArgumentParser(
             description="Pushes local commits as stacked PRs on GitHub and keeps them in sync.",
         )
@@ -275,6 +290,8 @@ class Main:
         task_validate_commits.wait()
         task_upsert_labels.wait()
         prs_by_url = dict((url, task.wait()) for (url, task) in tasks_gh_get_pr.items())
+
+        self.debug_log_commits(commits=commits, prs_by_url=prs_by_url)
 
         # Inject "Pull Request" URL to commit descriptions starting from the
         # commit which doesn't have it. This is a heavy-weighted process which
@@ -595,18 +612,31 @@ class Main:
             title,
             *(["--body-file", body_file] if body_file else ["--body", ""]),
         ]
-        returncode, output, stderr = self.shell_no_throw(cmd)
-        if returncode == 0:
-            return output, "created"
-        m = re.match(r".* already exists[^\n]\n(\S+)", stderr, flags=re.S)
-        if m:
-            return m.group(1), "up-to-date"
-        raise CalledProcessError(
-            returncode=returncode,
-            cmd=cmd,
-            output=output,
-            stderr=stderr,
-        )
+
+        attempt = 0
+        while True:
+            returncode, output, stderr = self.shell_no_throw(cmd)
+            if returncode == 0:
+                return output, "created"
+
+            m = re.match(r".* already exists[^\n]\n(\S+)", stderr, flags=re.S)
+            if m:
+                return m.group(1), "up-to-date"
+
+            m = re.match(r".* was submitted too quickly", stderr, flags=re.S)
+            if m and attempt < 3:
+                dt = 3 + random.random() * 3
+                self.debug_log_text(text=f"Waiting for {dt} seconds and retrying...")
+                sleep(dt)
+                attempt += 1
+                continue
+
+            raise CalledProcessError(
+                returncode=returncode,
+                cmd=cmd,
+                output=output,
+                stderr=stderr,
+            )
 
     #
     # Updates base_branch and description suffix of the PR.
@@ -969,6 +999,7 @@ class Main:
         comment: str | None = None,
     ) -> str:
         out = None
+        returncode = 0
         time_start = time()
         try:
             out = check_output(
@@ -979,12 +1010,17 @@ class Main:
                 env={**os.environ, **env} if env else None,
             )
             return out if no_rstrip else out.rstrip()
+        except CalledProcessError as e:
+            returncode = e.returncode
+            out = "\n".join(s for s in [e.stdout, e.stderr] if s)
+            raise
         finally:
             self.debug_log_shell_command(
                 cmd=cmd,
                 env=env,
                 out=out,
                 took_s=time() - time_start,
+                returncode=returncode,
                 comment=comment,
             )
 
@@ -1002,6 +1038,7 @@ class Main:
     ) -> tuple[int, str, str]:
         stdout = ""
         stderr = ""
+        returncode = None
         time_start = time()
         try:
             proc = Popen(
@@ -1015,6 +1052,7 @@ class Main:
             if not no_rstrip:
                 stdout = stdout.rstrip()
                 stderr = stderr.rstrip()
+            returncode = proc.returncode
             return (
                 proc.returncode,
                 stdout,
@@ -1024,8 +1062,9 @@ class Main:
             self.debug_log_shell_command(
                 cmd=cmd,
                 env=env,
-                out="\n".join([s for s in [stdout, stderr] if s]),
+                out="\n".join(s for s in [stdout, stderr] if s),
                 took_s=time() - time_start,
+                returncode=returncode,
                 comment=comment,
             )
 
@@ -1042,7 +1081,12 @@ class Main:
     ):
         out = ""
         self.debug_log_shell_command(
-            cmd=cmd, env=env, out="", took_s=0, comment=comment
+            cmd=cmd,
+            env=env,
+            out="",
+            took_s=0,
+            returncode=None,
+            comment=comment,
         )
         with Popen(
             cmd,
@@ -1073,7 +1117,7 @@ class Main:
         if not os.path.exists(f"{dir}/.git"):
             return
         self.shell_no_throw(
-            ["bash", "-c", f"cd {shlex.quote(dir)} && git pull --rebase"],
+            ["sh", "-c", f"cd {shlex.quote(dir)} && git pull --rebase"],
             comment="self-update",
         )
 
@@ -1084,9 +1128,14 @@ class Main:
         title = title.strip()
         title = re.sub(r"^\w+[()\[\]\w]*:\s+", "", title)
         title = re.sub(r"\[[-\w]+\]$", "", title)
-        if len(title) > MAX_TITLE_LEN_IN_PRINT + 3:
-            title = title[0:MAX_TITLE_LEN_IN_PRINT] + "…"
-        return title.strip()
+        title = title.strip()
+        max_len = max(
+            MIN_TITLE_LEN_IN_PRINT,
+            TERMINAL_SIZE.columns - 22,
+        )
+        if len(title) > max_len:
+            title = title[0:max_len] + "…"
+        return title
 
     #
     # Builds branch name from commit title.
@@ -1111,8 +1160,12 @@ class Main:
         branch: str,
         result: BranchPushResult,
     ):
-        if len(branch) > MAX_BRANCH_LEN_IN_PRINT:
-            branch = branch[0:MAX_BRANCH_LEN_IN_PRINT] + "…"
+        max_len = max(
+            MIN_BRANCH_LEN_IN_PRINT,
+            TERMINAL_SIZE.columns - (11 + 4 + len(self.remote) + 10) - 5,
+        )
+        if len(branch) > max_len:
+            branch = branch[0:max_len] + "…"
         print(f"  ── {type}: {self.remote}/{branch} ({result})")
         sys.stdout.flush()
 
@@ -1170,6 +1223,49 @@ class Main:
         sys.stdout.flush()
 
     #
+    # Logs the current command line arguments.
+    #
+    def debug_log_argv(self):
+        text = shlex.join(sys.argv).strip()
+        for var in [INTERNAL_IN_REBASE_INTERACTIVE_VAR, INTERNAL_SKIP_UPDATE_PRS_VAR]:
+            value = os.environ.get(var)
+            if value:
+                text = f"{var}={shlex.quote(value)} {text}"
+        self.debug_log_text(text=text)
+
+    #
+    # Logs a list of commits and their corresponding PR statuses.
+    #
+    def debug_log_commits(
+        self,
+        *,
+        commits: list[Commit],
+        prs_by_url: dict[str, Pr],
+    ):
+        max_url_len = max(
+            [len(c.url) for c in commits if c.url],
+            default=0,
+        )
+        max_state_len = max(
+            [len(pr.state) for pr in prs_by_url.values()],
+            default=0,
+        )
+        max_head_branch_len = max(
+            [len(pr.head_branch) for pr in prs_by_url.values()],
+            default=0,
+        )
+        lines: list[str] = []
+        for c in commits:
+            url = c.url or "-"
+            pr = prs_by_url.get(url)
+            state = pr.state if pr else "-"
+            head_branch = pr.head_branch if pr else "-"
+            lines.append(
+                f"{c.hash} | {url.ljust(max_url_len)} | {head_branch.ljust(max_head_branch_len)} | {state.ljust(max_state_len)} | {c.title}"
+            )
+        self.debug_log_text(text="\n".join(lines))
+
+    #
     # Logs a command which is run by the tool.
     #
     def debug_log_shell_command(
@@ -1179,6 +1275,7 @@ class Main:
         env: dict[str, str] | None,
         out: str | None,
         took_s: float,
+        returncode: int | None,
         comment: str | None = None,
     ):
         rows: list[tuple[tuple[int, int, int], str]] = []
@@ -1193,8 +1290,9 @@ class Main:
                 )
                 + shlex.join(cmd).strip()
                 + (f" # took {int(took_s * 1000)} ms" if took_s else "")
+                + (f" # returncode={returncode}" if returncode else "")
                 + (
-                    f", ran in a parallel thread"
+                    f" # ran in a parallel thread"
                     if current_thread() is not main_thread()
                     else ""
                 )
@@ -1217,19 +1315,23 @@ class Main:
         if os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR):
             rows = [(row[0], re.sub(r"^", "> ", row[1], flags=re.M)) for row in rows]
 
-        try:
-            with open(DEBUG_FILE, "a+") as file:
-                file.write(f"=== {datetime.now()}\n")
-                for row in rows:
-                    file.write(row[1] + "\n")
-                file.write("\n")
-        except:
-            pass
-
+        self.debug_log_text(text="\n".join(row[1] for row in rows))
         if self.debug:
             for row in rows:
                 print(colored(*row[0], row[1]))
             sys.stdout.flush()
+
+    #
+    # Logs a text block (prepended by date) to the debug file.
+    #
+    def debug_log_text(self, *, text: str):
+        try:
+            with open(DEBUG_FILE, "a+") as file:
+                file.write(f"=== {datetime.now()}\n")
+                file.write(f"{text.rstrip()}\n")
+                file.write("\n")
+        except:
+            pass
 
     #
     # Caches the return value of a function in environment and returns it next time
@@ -1247,6 +1349,7 @@ class Main:
                 env=None,
                 out=value,
                 took_s=0,
+                returncode=None,
                 comment="cache hit",
             )
         return value

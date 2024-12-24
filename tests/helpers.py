@@ -28,7 +28,7 @@ def import_path(path: str):
 
 
 def dedent(text: str) -> str:
-    return textwrap.dedent(re.sub(r"^\n", "", text, re.S))
+    return textwrap.dedent(re.sub(r"^\n", "", text, flags=re.S))
 
 
 def check_output_x(*cmd: str) -> str:
@@ -42,11 +42,11 @@ def check_output_x(*cmd: str) -> str:
         ) from None
 
 
-def git_init_and_cd_to_test_dir(*, dir: str, branch: str):
+def git_init_and_cd_to_test_dir(*, dir: str, initial_branch: str):
     rmtree(dir, ignore_errors=True)
     mkdir(dir)
     chdir(dir)
-    check_output_x("git", "init", f"--initial-branch={branch}")
+    check_output_x("git", "init", f"--initial-branch={initial_branch}")
     check_output_x("git", "config", "user.name", "tests")
     check_output_x("git", "config", "user.email", "tests@example.com")
     check_output_x("git", "config", "push.default", "current")
@@ -79,7 +79,7 @@ def git_init_and_cd_to_test_dir(*, dir: str, branch: str):
     branches = [
         b.replace(f"{TEST_REMOTE}/", "")
         for b in check_output_x("git", "branch", "-r").split()
-        if "/grok/" in b and branch in b
+        if "/grok/" in b and initial_branch in b
     ]
     pr_ids = check_output_x(
         "gh",
@@ -90,7 +90,7 @@ def git_init_and_cd_to_test_dir(*, dir: str, branch: str):
         "--json",
         "headRefName,number",
         "--jq",
-        f'.[] | select(.headRefName | contains("{branch}")) | .number',
+        f'.[] | select(.headRefName | contains("{initial_branch}")) | .number',
     ).split()
     tasks = [
         git_grok.Task(check_output_x, "gh", "pr", "close", pr_id) for pr_id in pr_ids
@@ -159,11 +159,21 @@ class TestCaseWithEmptyTestRepo(TestCase):
         prefix = (
             "local-"
             if not github_ref
-            else f"main-" if github_ref == "refs/heads/main" else ""
+            else (
+                f"main-"
+                if github_ref == "refs/heads/main"
+                else (
+                    f"pr{m.group(1)}-"
+                    if (m := re.match(r"refs/pull/(\d+)/", github_ref))
+                    else ""
+                )
+            )
         )
         self.cwd = getcwd()
-        self.branch = f"{prefix}tests{python_version()}"
-        git_init_and_cd_to_test_dir(dir="/tmp/git-grok-tests", branch=self.branch)
+        self.initial_branch = f"{prefix}tests{python_version()}"
+        git_init_and_cd_to_test_dir(
+            dir="/tmp/git-grok-tests", initial_branch=self.initial_branch
+        )
 
     def tearDown(self):
         chdir(self.cwd)
