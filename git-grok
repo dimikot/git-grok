@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse
+import hashlib
 import json
 import os
 import random
@@ -95,11 +96,10 @@ class InRebaseInteractiveData:
 
     @staticmethod
     def parse(str: str) -> InRebaseInteractiveData | None:
-        match = re.match(r"^(\d+)/(\d+)$", str)
-        if match:
+        if m := re.match(r"^(\d+)/(\d+)$", str):
             return InRebaseInteractiveData(
-                commit_index_one_based=int(match.group(1)),
-                total_commits_in_stack=int(match.group(2)),
+                commit_index_one_based=int(m.group(1)),
+                total_commits_in_stack=int(m.group(2)),
             )
         return None
 
@@ -159,10 +159,11 @@ class Main:
 
         if not in_rebase_interactive:
             self.self_update()
+            # For debug purposes only.
+            self.shell_no_throw(["git", "--version"])
+            self.shell_no_throw(["git", "status"])
+            self.shell_no_throw(["git", "log", "--graph", "--decorate", "-3"])
 
-        # For debug purposes only.
-        self.shell_no_throw(["git", "status"])
-        self.shell_no_throw(["git", "log", "--graph", "--decorate", "-3"])
         # Below is the real work.
         self.login = self.cache_through(
             "gh_get_current_login",
@@ -500,11 +501,10 @@ class Main:
             assert (
                 c.url is not None
             ), f"commit {c.hash} PR URL is expected to be in the message at this point"
-            match = re.search(r"/(\d+)$", c.url)
-            if match:
-                pr_numbers.append(int(match.group(1)))
+            if m := re.search(r"/(\d+)$", c.url):
+                pr_numbers.append(int(m.group(1)))
                 if c.hash == commit.hash:
-                    pr_number_current = int(match.group(1))
+                    pr_number_current = int(m.group(1))
         assert (
             commit.url is not None
         ), f"commit {commit.hash} PR URL is expected to be in the message at this point"
@@ -525,7 +525,26 @@ class Main:
     # Returns current git folder remote (most often "origin").
     #
     def git_get_current_remote(self) -> str:
-        return self.shell(["git", "remote", "show"])
+        [_, symbolic_ref, _] = self.shell_no_throw(
+            ["git", "symbolic-ref", "-q", "HEAD"]
+        )
+        if not symbolic_ref:
+            raise UserException(
+                'To run git-grok, you must be on a branch. Check your "git status".'
+            )
+        push_short = self.shell(
+            ["git", "for-each-ref", "--format=%(push:short)", symbolic_ref]
+        )
+        if not (m := re.match(r"^([^/]+)/.+$", push_short)):
+            raise UserException(
+                f'fatal: No configured push destination for symbolic ref "{symbolic_ref}".\n'
+                + "\n"
+                + "Git infers the current remote from the branch name using one of the following ways:\n"
+                + '1. It checks whether "git config branch.<branch>.remote" is set explicitly.\n'
+                + '2. Or, if "git config push.default" is "current" or "matching", there must be\n'
+                + "   only one remote configured.\n"
+            )
+        return m.group(1)
 
     #
     # Returns the current remote branch name on GitHub.
@@ -534,11 +553,9 @@ class Main:
         branch = self.shell(["git", "branch", "--show-current"])
         if not branch:
             path = ".git/rebase-merge/head-name"
-            file = find_file_in_parents(path)
-            if file:
+            if file := find_file_in_parents(path):
                 branch = open(file).readline().strip()
-                m = re.match(r"refs/heads/(.+)", branch)
-                if not m:
+                if not (m := re.match(r"refs/heads/(.+)", branch)):
                     raise UserException(f"File {path} doesn't contain refs/heads/*")
                 branch = m.group(1)
             else:
@@ -626,12 +643,12 @@ class Main:
             if returncode == 0:
                 return output, "created"
 
-            m = re.match(r".* already exists[^\n]\n(\S+)", stderr, flags=re.S)
-            if m:
+            if m := re.match(r".* already exists[^\n]\n(\S+)", stderr, flags=re.S):
                 return m.group(1), "up-to-date"
 
-            m = re.match(r".* was submitted too quickly", stderr, flags=re.S)
-            if m and attempt < 3:
+            if attempt < 3 and (
+                m := re.match(r".* was submitted too quickly", stderr, flags=re.S)
+            ):
                 dt = 3 + random.random() * 3
                 self.debug_log_text(text=f"Waiting for {dt} seconds and retrying...")
                 sleep(dt)
@@ -781,13 +798,17 @@ class Main:
         commits: list[Commit] = []
         for commit in re.split(r"^(?=commit )", out, flags=re.M)[1:]:
             try:
-                m = re.match(r"commit (\w+)[^\n]*\n(.*?)\n\n(.*)$", commit, flags=re.S)
-                if not m:
+
+                if not (
+                    m := re.match(
+                        r"commit (\w+)[^\n]*\n(.*?)\n\n(.*)$", commit, flags=re.S
+                    )
+                ):
                     raise UserException("Can't parse commit-headers-body.")
+
                 hash, _headers, body = m.group(1), m.group(2), m.group(3).rstrip()
 
-                m = re.match(r"([^\n]+)\n?(.*)$", body, flags=re.S)
-                if not m:
+                if not (m := re.match(r"([^\n]+)\n?(.*)$", body, flags=re.S)):
                     raise UserException(f"Can't extract commit title and description.")
                 title, description = m.group(1).strip(), m.group(2)
 
@@ -886,8 +907,7 @@ class Main:
             ["git", "show", "--pretty=format:%B", "--no-patch"],
             no_rstrip=True,
         )
-        m = re.search(rf"^{header_name}: [^\n]+", message, flags=re.M)
-        if m:
+        if m := re.search(rf"^{header_name}: [^\n]+", message, flags=re.M):
             new_message = message.replace(m[0], new_header)
         else:
             new_message = f"{message.rstrip()}\n\n{new_header}"
@@ -1253,7 +1273,8 @@ class Main:
     # it's requested.
     #
     def cache_through(self, key: str, func: Callable[[], str]) -> str:
-        var = f"{INTERNAL_ENV_VAR_PREFIX}:{key}"
+        key = hashify(key)
+        var = f"{INTERNAL_ENV_VAR_PREFIX}_{key}"
         value = os.environ.get(var)
         if value is None:
             value = func()
@@ -1273,7 +1294,8 @@ class Main:
     # Removes the cached value for the key.
     #
     def cache_clean(self, key: str):
-        var = f"{INTERNAL_ENV_VAR_PREFIX}:{key}"
+        key = hashify(key)
+        var = f"{INTERNAL_ENV_VAR_PREFIX}_{key}"
         os.environ.pop(var, None)
 
 
@@ -1329,6 +1351,19 @@ def body_suffix_upsert(
     if re.search(BODY_SUFFIX_RE, body, flags=re.M | re.I | re.X):
         return re.sub(BODY_SUFFIX_RE, suffix, body, flags=re.M | re.I | re.X)
     return body.rstrip() + "\n\n" + suffix
+
+
+#
+# Hashes a text, but keeps it recognizable. Seems like in some shells, we can't
+# have env variables with arbitrary characters, so we have to normalize
+# (otherwise, some tests fail in GitHub Actions).
+#
+def hashify(text: str) -> str:
+    return (
+        re.sub(r"^_+|_+$", "", re.sub(r"[^A-Za-z0-9]+", "_", text))
+        + "_"
+        + hashlib.sha256(text.encode()).hexdigest()[0:8]
+    )
 
 
 #

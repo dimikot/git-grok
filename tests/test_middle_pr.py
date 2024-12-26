@@ -12,12 +12,12 @@ from unittest import main
 
 class Test(TestCaseWithEmptyTestRepo):
     def test_middle_pr_label_at_initial_prs_creation_and_updates(self):
+        self.git_init_and_cd_to_test_dir()
+
         git_touch("commit01")
         git_add_commit("commit01")
-
         git_touch("commit02")
         git_add_commit("commit02")
-
         git_touch("commit03")
         git_add_commit("commit03")
 
