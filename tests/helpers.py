@@ -1,7 +1,9 @@
+import json
 import re
 import shlex
 import sys
 import textwrap
+from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from importlib.util import spec_from_loader, module_from_spec
 from os import chdir, getcwd, mkdir, environ
@@ -15,6 +17,7 @@ from unittest import TestCase
 GIT_GROK_PATH = dirname(dirname(realpath(__file__))) + "/git-grok"
 TEST_REPO = "https://github.com/dimikot/git-grok-tests"
 TEST_REMOTE = "tests-origin"
+MAX_BRANCH_AGE = timedelta(minutes=10)
 
 
 def import_path(path: str):
@@ -88,29 +91,59 @@ def git_init_and_cd_to_test_dir(
         )
 
     check_output_x("git", "fetch")
-    branches = [
-        b.replace(f"{TEST_REMOTE}/", "")
-        for b in check_output_x("git", "branch", "-r").split()
-        if "/grok/" in b and initial_branch in b
+    old_branches = [
+        {"name": name.replace(f"{TEST_REMOTE}/", ""), "date": date}
+        for b in check_output_x(
+            "git",
+            "for-each-ref",
+            "--format=%(refname:short) %(committerdate:iso8601-strict)",
+            "refs/remotes",
+        ).splitlines()
+        for name, date in [b.split()]
+        if (
+            name != f"{TEST_REMOTE}/main"
+            and datetime.now(timezone.utc)
+            - datetime.fromisoformat(date.replace("Z", "+00:00"))
+            > MAX_BRANCH_AGE
+        )
+        or ("grok/" in name and initial_branch in name)
     ]
-    pr_ids = check_output_x(
-        "gh",
-        "pr",
-        "list",
-        "-s",
-        "open",
-        "--json",
-        "headRefName,number",
-        "--jq",
-        f'.[] | select(.headRefName | contains("{initial_branch}")) | .number',
-    ).split()
+    old_prs = [
+        pr
+        for pr in json.loads(
+            check_output_x(
+                "gh",
+                "pr",
+                "list",
+                "-s",
+                "open",
+                "--json",
+                "headRefName,number,updatedAt",
+            )
+        )
+        if (
+            datetime.now(timezone.utc)
+            - datetime.fromisoformat(pr["updatedAt"].replace("Z", "+00:00"))
+            > MAX_BRANCH_AGE
+        )
+        or initial_branch in pr["headRefName"]
+    ]
     tasks = [
-        git_grok.Task(check_output_x, "gh", "pr", "close", pr_id) for pr_id in pr_ids
-    ] + [
-        git_grok.Task(check_output_x, "git", "push", TEST_REMOTE, "--delete", branch)
-        for branch in branches
+        git_grok.Task(check_output_x, "gh", "pr", "close", str(pr["number"]))
+        for pr in old_prs
     ]
-    [task.wait() for task in tasks]
+    if old_branches:
+        tasks.append(
+            git_grok.Task(
+                check_output_x,
+                "git",
+                "push",
+                TEST_REMOTE,
+                "--delete",
+                *[branch["name"] for branch in old_branches],
+            )
+        )
+    [task.wait() for task in tasks if task]
 
 
 def git_touch(file: str):
@@ -192,8 +225,10 @@ class TestCaseWithEmptyTestRepo(TestCase):
         *,
         method: Literal["push.default", "set-upstream"] = "set-upstream",
     ):
+        dir = "/tmp/git-grok-tests"
+        print(f"preparing empty repo at {dir}...")
         git_init_and_cd_to_test_dir(
-            dir="/tmp/git-grok-tests",
+            dir=dir,
             initial_branch=self.initial_branch,
             method=method,
         )
