@@ -42,6 +42,7 @@ INTERNAL_SKIP_UPDATE_PRS_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_skip_update_prs"
 DEBUG_FILE = "/tmp/git-grok.log"
 DEBUG_COLOR_GRAY_1 = (128, 128, 128)
 DEBUG_COLOR_GRAY_2 = (92, 92, 92)
+GH_MIN_VERSION = "2.29.0"
 
 try:
     TERMINAL_SIZE = os.get_terminal_size()
@@ -158,9 +159,10 @@ class Main:
         self.debug_force_push_branches = args.debug_force_push_branches
 
         if not in_rebase_interactive:
+            self.gh_verify_version()
+            self.git_verify_version()
             self.self_update()
             # For debug purposes only.
-            self.shell_no_throw(["git", "--version"])
             self.shell_no_throw(["git", "status"])
             self.shell_no_throw(["git", "log", "--graph", "--decorate", "-3"])
 
@@ -276,15 +278,9 @@ class Main:
             return
 
         task_upsert_labels = Task(self.gh_upsert_labels)
-        tasks_gh_get_pr = (
-            dict(
-                [
-                    (url, Task(self.gh_get_pr, url=url))
-                    for url in (c.url for c in reversed(commits) if c.url)
-                ]
-            )
-            if not self.debug_force_push_branches
-            else {}
+        tasks_gh_get_pr = dict(
+            (url, Task(self.gh_get_pr, url=url))
+            for url in (c.url for c in reversed(commits) if c.url)
         )
         task_upsert_labels.wait()
         prs_by_url = dict((url, task.wait()) for (url, task) in tasks_gh_get_pr.items())
@@ -516,10 +512,28 @@ class Main:
         )
 
     #
+    # Verifies that the gh supports e.g. autoMergeRequest field.
+    #
+    def gh_verify_version(self):
+        out = self.shell(["gh", "--version"])
+        if not (m := re.search(r"(version\s+|v)(\d+(\.\d+)+)", out)) or parse_version(
+            m.group(2)
+        ) < parse_version(GH_MIN_VERSION):
+            raise UserException(
+                f"The tool requires gh version {GH_MIN_VERSION} or higher; please upgrade. Got:\n{out.strip()}"
+            )
+
+    #
     # Returns current GitHub login.
     #
     def gh_get_current_login(self) -> str:
         return self.shell(["gh", "api", "user", "--jq", ".login"])
+
+    #
+    # Verifies Git version.
+    #
+    def git_verify_version(self):
+        self.shell_no_throw(["git", "--version"])
 
     #
     # Returns current git folder remote (most often "origin").
@@ -1364,6 +1378,13 @@ def hashify(text: str) -> str:
         + "_"
         + hashlib.sha256(text.encode()).hexdigest()[0:8]
     )
+
+
+#
+# Parses a version string into a tuple of integers.
+#
+def parse_version(v: str) -> tuple[int, ...]:
+    return tuple(map(int, (v.split("."))))
 
 
 #
