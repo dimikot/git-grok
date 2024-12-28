@@ -3,21 +3,36 @@ import re
 import shlex
 import sys
 import textwrap
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from importlib.util import spec_from_loader, module_from_spec
+from itertools import groupby
 from os import chdir, getcwd, mkdir, environ
 from os.path import basename, dirname, realpath
 from platform import python_version
 from shutil import rmtree
 from subprocess import Popen, check_output, CalledProcessError, STDOUT, PIPE
-from typing import Literal
+from typing import Any, Literal, cast
 from unittest import TestCase
 
 GIT_GROK_PATH = dirname(dirname(realpath(__file__))) + "/git-grok"
 TEST_REPO = "https://github.com/dimikot/git-grok-tests"
 TEST_REMOTE = "tests-origin"
 MAX_BRANCH_AGE = timedelta(minutes=10)
+
+
+@dataclass
+class GarbageItem:
+    kind: Literal["sync", "async"]
+    name: str
+    ts: str
+
+
+@dataclass
+class GarbageTask:
+    kind: Literal["sync", "async"]
+    task: Any
 
 
 def import_path(path: str):
@@ -91,8 +106,13 @@ def git_init_and_cd_to_test_dir(
         )
 
     check_output_x("git", "fetch")
-    old_branches = [
-        {"name": name.replace(f"{TEST_REMOTE}/", ""), "date": date}
+
+    branches = [
+        GarbageItem(
+            kind=kind,
+            name=name.replace(f"{TEST_REMOTE}/", ""),
+            ts=date,
+        )
         for b in check_output_x(
             "git",
             "for-each-ref",
@@ -101,15 +121,23 @@ def git_init_and_cd_to_test_dir(
         ).splitlines()
         for name, date in [b.split()]
         if (
-            name != f"{TEST_REMOTE}/main"
-            and datetime.now(timezone.utc)
-            - datetime.fromisoformat(date.replace("Z", "+00:00"))
-            > MAX_BRANCH_AGE
+            kind := (
+                ("grok/" in name and initial_branch in name and "sync")
+                or (
+                    name != f"{TEST_REMOTE}/main"
+                    and from_now(date) > MAX_BRANCH_AGE
+                    and "async"
+                )
+                or None
+            )
         )
-        or ("grok/" in name and initial_branch in name)
     ]
-    old_prs = [
-        pr
+    prs = [
+        GarbageItem(
+            kind=kind,
+            name=str(pr["number"]),
+            ts=str(pr["updatedAt"]),
+        )
         for pr in json.loads(
             check_output_x(
                 "gh",
@@ -122,28 +150,37 @@ def git_init_and_cd_to_test_dir(
             )
         )
         if (
-            datetime.now(timezone.utc)
-            - datetime.fromisoformat(pr["updatedAt"].replace("Z", "+00:00"))
-            > MAX_BRANCH_AGE
+            kind := (
+                (initial_branch in pr["headRefName"] and "sync")
+                or (from_now(pr["updatedAt"]) > MAX_BRANCH_AGE and "async")
+                or None
+            )
         )
-        or initial_branch in pr["headRefName"]
     ]
+
     tasks = [
-        git_grok.Task(check_output_x, "gh", "pr", "close", str(pr["number"]))
-        for pr in old_prs
-    ]
-    if old_branches:
-        tasks.append(
-            git_grok.Task(
+        GarbageTask(
+            kind=pr.kind,
+            task=git_grok.Task(check_output_x, "gh", "pr", "close", pr.name),
+        )
+        for pr in prs
+    ] + [
+        GarbageTask(
+            kind=cast(Any, kind),
+            task=git_grok.Task(
                 check_output_x,
                 "git",
                 "push",
                 TEST_REMOTE,
                 "--delete",
-                *[branch["name"] for branch in old_branches],
-            )
+                *[branch.name for branch in group],
+            ),
         )
-    [task.wait() for task in tasks if task]
+        for kind, group in groupby(branches, key=lambda branch: branch.kind)
+    ]
+    [task.task.wait() for task in tasks if task.kind == "sync"]
+    # Leave async tasks work in background and swallow errors (e.g. in case a
+    # branch has already been deleted by a parallel test run or so).
 
 
 def git_touch(file: str):
@@ -232,6 +269,12 @@ class TestCaseWithEmptyTestRepo(TestCase):
             initial_branch=self.initial_branch,
             method=method,
         )
+
+
+def from_now(ts: str) -> timedelta:
+    return datetime.now(timezone.utc) - datetime.fromisoformat(
+        ts.replace("Z", "+00:00")
+    )
 
 
 git_grok = import_path(GIT_GROK_PATH)
