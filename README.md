@@ -9,7 +9,12 @@ One idempotent command to rule 'em all:
 git grok
 ```
 
-No arguments. No configuration. No interactivity. On intent.
+No arguments. No configuration. No interactivity.
+
+You don't need to learn a separate Git UI: continue running Git in console if
+you want, or use your favorite tools (like VSCode's Git panel).
+
+## Stacked PRs
 
 If you frequently write code and find it tedious to manage interdependent
 branches (like when "branch A depends on branch B which itself depends on branch
@@ -18,15 +23,23 @@ known as "stacked PRs", is used in Meta, Google and other leading companies.
 
 The central idea is that every individual commit in your local working copy
 becomes an individual pull request. Commits can be stacked on top of each other,
-reordered, and edited right on your computer using the standard `git` features.
+reordered, and edited right on your computer using the standard Git features.
 Then, run `git-grok` to sync the changes in local commits out to their
-corresponding PRs.
+corresponding PRs at GitHub.
 
-When you want to make changes based on feedback in some PR, just go to the local
-commit in your stack, make the change ("edit a commit in the middle of the
+When you want to make changes based on feedback in some PR, just "jump into" the
+local commit in your stack, make the change ("edit a commit in the middle of the
 stack"), and rerun `git grok` to get it propagated to the PRs at GitHub.
 
-<img src="media/he-grokked.jpg" />
+Want to reorder the commits to merge the approved one before another? Do it
+locally and run `git grok`.
+
+<img src="media/he-grokked.jpg" width="500" />
+
+The guy above hints that stacked PRs workflow is incredibly sticky, although it
+has some learning curve. (It's not the workflow that has the curve, but Git
+itself.) Try using `git-grok` for a week, and you'll never get back. This is a
+one way road.
 
 ## Installation
 
@@ -45,20 +58,18 @@ gh auth login
 
 ```bash
 cd your-repository
-git pull --rebase
+git pull
 
 # Create a PR from the topmost commit you've just made.
 touch commit1
-git add . && git commit -m "your commit message here"
+git add . && git commit -m "Some commit"
 git grok
 
 # Create more commits on top of each other, all on top of main.
 touch commit2
-git add . && git commit -m "your commit message here"
+git add . && git commit -m "Add more examples to README"
 touch commit3
-git add . && git commit -m "your commit message here"
-touch commit4
-git add . && git commit -m "your commit message here"
+git add . && git commit -m "Add a screenshot of git-grok run"
 
 # This turns each individual commit on top of main into individual PRs
 # (one commit = one PR) and keeps the PRs in sync with local commits.
@@ -107,8 +118,8 @@ PR in the stack by clicking the button in GitHub UI (it will go to the main
 branch).
 
 Then, after the PR is merged, GitHub is smart enough to update the base of the
-next PR in the stack to point to the main branch (hooray!). So you just switch
-to the 2nd PR in the stack and merge it.
+next PR in the stack to point to the main branch (hooray!). So you just click on
+the 2nd PR in the stack and merge it.
 
 Rinse.
 
@@ -118,6 +129,25 @@ Warning: pay attention to only merge (or rebase) into the main branch in GitHub
 UI. GitHub is smart, so it automatically changes the base of the next PR to main
 once its old branch is auto-deleted when you merge, but if you see something
 unusual, just rerun `git pull --rebase && git grok`
+
+## Most Magic is Provided by GitHub and Git...
+
+To demystify `git-grok`, it's worth pointing out a list of things that it does
+**not** do:
+
+1. It does not create commits.
+2. It does not modify commits code nor anyhow change the Git tree.
+3. It does not merge pull requests. Does not close PRs.
+4. It does not pull.
+5. It does not produce merge conflicts.
+6. It does not add reviewers to the PRs.
+7. It does not modify PR title and description.
+
+All of the above is done by either Git or GitHub.
+
+**What `git-grok` does:** is continuously ensures that each 1 existing local
+commit has 1 corresponding and up-to-date PR on GitHub. In that direction. Not
+more, not less.
 
 ## What if my GitHub Actions are slow, so they take minutes to execute?
 
