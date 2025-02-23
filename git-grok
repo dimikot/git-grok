@@ -183,7 +183,6 @@ class Main:
             self.run_in_rebase_interactive(data=in_rebase_interactive)
         else:
             self.run_all()
-        print("")
 
     #
     # Runs the sync for only the top commit. This is an internal command which
@@ -427,7 +426,7 @@ class Main:
         # previous commit PR's branch becomes the next commit PR's base branch.
         commits_chronological = list(reversed(commits))
         for i, commit in enumerate(commits_chronological):
-            self.print_header(f"\nUpdating PR: {self.clean_title(commit.title)}")
+            self.print_header(f"Updating PR: {self.clean_title(commit.title)}")
 
             if commit.hash in commit_hashes_to_push_branch:
                 commit, result = self.process_commit_push_branch(commit=commit)
@@ -599,19 +598,24 @@ class Main:
     # Pre-creates git-grok related labels.
     #
     def gh_upsert_labels(self):
-        self.shell(
-            [
-                "gh",
-                "label",
-                "create",
-                MIDDLE_PR_LABEL,
-                "-d",
-                MIDDLE_PR_LABEL_DESCRIPTION,
-                "-c",
-                MIDDLE_PR_LABEL_COLOR,
-                "--force",
-            ],
-        )
+        try:
+            self.shell(
+                [
+                    "gh",
+                    "label",
+                    "create",
+                    MIDDLE_PR_LABEL,
+                    "-d",
+                    MIDDLE_PR_LABEL_DESCRIPTION,
+                    "-c",
+                    MIDDLE_PR_LABEL_COLOR,
+                ],
+            )
+            # It's faster to ignore the "already exists" error than to use
+            # --force flag.
+        except CalledProcessError as e:
+            if "already exists" not in e.stderr:
+                raise
 
     #
     # Creates a GitHub PR between two existing branches. The description of the
