@@ -179,10 +179,80 @@ class Main:
             "git_get_current_remote_base_branch",
             self.git_get_current_remote_base_branch,
         )
-        if in_rebase_interactive:
-            self.run_in_rebase_interactive(data=in_rebase_interactive)
-        else:
+        if not in_rebase_interactive:
             self.run_all()
+        else:
+            self.run_in_rebase_interactive(data=in_rebase_interactive)
+
+    #
+    # Assuming all PRs in the stack already have PR URLs in their description,
+    # pushes the updated branches and updates the PRs descriptions with the full
+    # list of commits in the stack.
+    #
+    def run_all(self):
+        commits = self.git_get_commits()
+        if len(commits) == 0:
+            self.print_header(
+                f"There are no local commits on top of {self.remote}. Commit something and rerun."
+            )
+            return
+
+        task_upsert_labels = Task(self.gh_upsert_labels)
+        tasks_gh_get_pr = dict(
+            (url, Task(self.gh_get_pr, url=url))
+            for url in (c.url for c in reversed(commits) if c.url)
+        )
+        task_upsert_labels.wait()
+        prs_by_url = dict((url, task.wait()) for (url, task) in tasks_gh_get_pr.items())
+
+        self.debug_log_commits(commits=commits, prs_by_url=prs_by_url)
+
+        self.process_validate_commits(commits=commits, prs_by_url=prs_by_url)
+
+        # Inject "Pull Request" URL to commit descriptions starting from the
+        # commit which doesn't have it. This is a heavy-weighted process which
+        # is run for each commit in an interactive rebase, starting from bottom
+        # to the very top.
+        commit_with_no_url: Commit | None = None
+        commit_hashes_to_push_branch: list[str] = []
+        for commit in reversed(commits):
+            if self.debug_force_push_branches or not commit.url:
+                commit_with_no_url = commit
+                break
+            else:
+                pr = prs_by_url[commit.url]
+                if pr.state == "MERGED" and pr.base_branch.startswith(BRANCH_PREFIX):
+                    # If the PR was accidentally merged, we need to create a new
+                    # PR for the commit, as if no PR existed at all.
+                    commit_with_no_url = commit
+                    break
+                else:
+                    commit_hashes_to_push_branch.append(commit.hash)
+
+        # Some commits have no related PRs (no GitHub URLs in the message)?
+        # Create missing PRs and amend their messages (via rebase interactive).
+        if commit_with_no_url:
+            self.process_create_missing_prs(
+                earliest_hash=commit_with_no_url.hash,
+                commits=commits,
+            )
+            commits = self.git_get_commits()
+
+        # Update PRs for commits; they now all have URLs. Do not push branches
+        # for commits for which we have just created missing PRs above (if any),
+        # i.e. only push branches for commit_hashes_to_push_branch. This allows
+        # to not re-trigger GitHub Actions. Notice that these branches WILL be
+        # pushed next time, because we updated the commit message (added "Pull
+        # Request" header with the just-created PR URL there which is impossible
+        # to predict in advance), i.e. the sequence is "push branch - create PR
+        # - update commit message - push branch", but the last step of this
+        # sequence is delayed till the next run, when the author has some other
+        # updates to piggy-back likely.
+        if not os.environ.get(INTERNAL_SKIP_UPDATE_PRS_VAR):
+            self.process_update_existing_prs(
+                commits=commits,
+                commit_hashes_to_push_branch=commit_hashes_to_push_branch,
+            )
 
     #
     # Runs the sync for only the top commit. This is an internal command which
@@ -262,74 +332,6 @@ class Main:
             )
             if result != "up-to-date":
                 self.print_commit_message_updated()
-
-    #
-    # Assuming all PRs in the stack already have PR URLs in their description,
-    # pushes the updated branches and updates the PRs descriptions with the full
-    # list of commits in the stack.
-    #
-    def run_all(self):
-        commits = self.git_get_commits()
-        if len(commits) == 0:
-            self.print_header(
-                f"There are no local commits on top of {self.remote}. Commit something and rerun."
-            )
-            return
-
-        task_upsert_labels = Task(self.gh_upsert_labels)
-        tasks_gh_get_pr = dict(
-            (url, Task(self.gh_get_pr, url=url))
-            for url in (c.url for c in reversed(commits) if c.url)
-        )
-        task_upsert_labels.wait()
-        prs_by_url = dict((url, task.wait()) for (url, task) in tasks_gh_get_pr.items())
-
-        self.debug_log_commits(commits=commits, prs_by_url=prs_by_url)
-
-        self.process_validate_commits(commits=commits, prs_by_url=prs_by_url)
-
-        # Inject "Pull Request" URL to commit descriptions starting from the
-        # commit which doesn't have it. This is a heavy-weighted process which
-        # is run for each commit in an interactive rebase, starting from bottom
-        # to the very top.
-        commit_with_no_url: Commit | None = None
-        commit_hashes_to_push_branch: list[str] = []
-        for commit in reversed(commits):
-            if self.debug_force_push_branches or not commit.url:
-                commit_with_no_url = commit
-                break
-            else:
-                pr = prs_by_url[commit.url]
-                if pr.state == "MERGED" and pr.base_branch.startswith(BRANCH_PREFIX):
-                    commit_with_no_url = commit
-                    break
-                else:
-                    commit_hashes_to_push_branch.append(commit.hash)
-
-        # Some commits have no related PRs (no GitHub URLs in the message)?
-        # Create missing PRs and amend their messages (via rebase interactive).
-        if commit_with_no_url:
-            self.process_create_missing_prs(
-                earliest_hash=commit_with_no_url.hash,
-                commits=commits,
-            )
-            commits = self.git_get_commits()
-
-        # Update PRs for commits; they now all have URLs. Do not push branches
-        # for commits for which we have just created missing PRs above (if any),
-        # i.e. only push branches for commit_hashes_to_push_branch. This allows
-        # to not re-trigger GitHub Actions. Notice that these branches WILL be
-        # pushed next time, because we updated the commit message (added "Pull
-        # Request" header with the just-created PR URL there which is impossible
-        # to predict in advance), i.e. the sequence is "push branch - create PR
-        # - update commit message - push branch", but the last step of this
-        # sequence is delayed till the next run, when the author has some other
-        # updates to piggy-back likely.
-        if not os.environ.get(INTERNAL_SKIP_UPDATE_PRS_VAR):
-            self.process_update_existing_prs(
-                commits=commits,
-                commit_hashes_to_push_branch=commit_hashes_to_push_branch,
-            )
 
     #
     # Checks that the tool can process this stack of commits at all.
