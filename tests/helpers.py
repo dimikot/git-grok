@@ -192,6 +192,18 @@ def git_add_commit(msg: str):
     check_output_x("git", "commit", "-m", msg)
 
 
+def git_log_get_hashes():
+    return check_output_x("git", "log", "--pretty=format:%H").split()
+
+
+def git_reset_hard(ref: str):
+    check_output_x("git", "reset", "--hard", ref)
+
+
+def git_cherry_pick(hashes: list[str]):
+    check_output_x("git", "cherry-pick", *hashes)
+
+
 def git_push():
     check_output_x("git", "push", "-f", "--set-upstream", TEST_REMOTE)
 
