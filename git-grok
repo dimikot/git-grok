@@ -127,6 +127,7 @@ class Main:
     login: str
     remote: str
     remote_base_branch: str = "master"
+    in_rebase_interactive: InRebaseInteractiveData | None = None
 
     #
     # Main entry point.
@@ -151,14 +152,14 @@ class Main:
         )
         args = parser.parse_args()
 
-        in_rebase_interactive = InRebaseInteractiveData.parse(
+        self.in_rebase_interactive = InRebaseInteractiveData.parse(
             os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR, "")
         )
 
         self.debug = args.debug
         self.debug_force_push_branches = args.debug_force_push_branches
 
-        if not in_rebase_interactive:
+        if not self.in_rebase_interactive:
             self.gh_verify_version()
             self.git_verify_version()
             self.self_update()
@@ -179,10 +180,10 @@ class Main:
             "git_get_current_remote_base_branch",
             self.git_get_current_remote_base_branch,
         )
-        if not in_rebase_interactive:
+        if not self.in_rebase_interactive:
             self.run_all()
         else:
-            self.run_in_rebase_interactive(data=in_rebase_interactive)
+            self.run_in_rebase_interactive(data=self.in_rebase_interactive)
 
     #
     # Assuming all PRs in the stack already have PR URLs in their description,
@@ -227,6 +228,8 @@ class Main:
                     commit_with_no_url = commit
                     break
                 else:
+                    # Push this branch and see whether GitHub says whether it
+                    # was up to date or not.
                     commit_hashes_to_push_branch.append(commit.hash)
 
         # Some commits have no related PRs (no GitHub URLs in the message)?
@@ -342,11 +345,11 @@ class Main:
         commits: list[Commit],
         prs_by_url: dict[str, Pr],
     ):
-        commits_chronological = list(reversed(commits))
-        for i, commit in list(enumerate(commits_chronological))[1:]:
+        commits_old_to_new = list(reversed(commits))
+        for i, commit in list(enumerate(commits_old_to_new))[1:]:
             pr = prs_by_url.get(commit.url, None) if commit.url else None
             if pr and pr.auto_merge_status == "ENABLED":
-                prev_commit = commits_chronological[i - 1]
+                prev_commit = commits_old_to_new[i - 1]
                 prev_pr = (
                     prs_by_url.get(prev_commit.url, None) if prev_commit.url else None
                 )
@@ -426,8 +429,8 @@ class Main:
     ):
         # We must iterate from the oldest commit to the newest one, because
         # previous commit PR's branch becomes the next commit PR's base branch.
-        commits_chronological = list(reversed(commits))
-        for i, commit in enumerate(commits_chronological):
+        commits_old_to_new = list(reversed(commits))
+        for i, commit in enumerate(commits_old_to_new):
             self.print_header(f"Updating PR: {self.clean_title(commit.title)}")
 
             if commit.hash in commit_hashes_to_push_branch:
@@ -438,13 +441,10 @@ class Main:
                         branch=str(commit.branch),
                         result=result,
                     )
-                commits_chronological[i] = commit
+                commits_old_to_new[i] = commit
 
-            assert (
-                commit.url is not None
-            ), f"commit {commit.hash} PR url is expected to be in the message at this point"
             pr, result = self.process_update_pr(
-                prev_commit=commits_chronological[i - 1] if i > 0 else None,
+                prev_commit=commits_old_to_new[i - 1] if i > 0 else None,
                 commit=commit,
                 commits=commits,
             )
@@ -453,7 +453,7 @@ class Main:
                 result=result,
                 review_decision=pr.review_decision,
             )
-            commits_chronological[i].branch = pr.head_branch
+            commits_old_to_new[i].branch = pr.head_branch
 
     #
     # Pushes an existing branch (it we know this commit's PR URL by querying
@@ -495,16 +495,12 @@ class Main:
         pr_numbers: list[int] = []
         pr_number_current: int | None = None
         for c in commits:
-            assert (
-                c.url is not None
-            ), f"commit {c.hash} PR URL is expected to be in the message at this point"
+            assert c.url is not None
             if m := re.search(r"/(\d+)$", c.url):
                 pr_numbers.append(int(m.group(1)))
                 if c.hash == commit.hash:
                     pr_number_current = int(m.group(1))
-        assert (
-            commit.url is not None
-        ), f"commit {commit.hash} PR URL is expected to be in the message at this point"
+        assert commit.url is not None
         return self.gh_update_pr(
             url=commit.url,
             base_branch=prev_commit.branch if prev_commit else None,
@@ -1147,7 +1143,7 @@ class Main:
     # Prints a status after a commit message was updated locally.
     #
     def print_commit_message_updated(self):
-        print(f"  ── updated commit message")
+        print(f"  ── added PR URL to commit's message to bind them")
         sys.stdout.flush()
 
     #
@@ -1282,7 +1278,15 @@ class Main:
     def debug_log_text(self, *, text: str):
         try:
             with open(DEBUG_FILE, "a+") as file:
-                file.write(f"=== {datetime.now()}\n")
+                file.write(
+                    f"=== {datetime.now()}"
+                    + (
+                        f" (in rebase interactive, {self.in_rebase_interactive.commit_index_one_based}/{self.in_rebase_interactive.total_commits_in_stack})"
+                        if self.in_rebase_interactive
+                        else ""
+                    )
+                    + "\n"
+                )
                 file.write(f"{text.rstrip()}\n")
                 file.write("\n")
         except:
