@@ -828,6 +828,7 @@ class Main:
                 self.git_push_branches(
                     branches=[Branch(hash=temp_commit_hash, branch=pr.head_branch)]
                 )
+                sleep(5)  # GitHub replication lag?
                 self.shell(
                     [
                         "gh",
