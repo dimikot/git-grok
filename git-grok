@@ -85,6 +85,13 @@ class Pr:
     state: Literal["OPEN", "CLOSED", "MERGED"]
     auto_merge_status: Literal["ENABLED", "DISABLED"]
     labels: list[str]
+    commit_hashes: list[str]
+
+    def is_accidentally_merged(self) -> bool:
+        return self.state == "MERGED" and self.base_branch.startswith(BRANCH_PREFIX)
+
+    def is_closed_and_non_openable(self) -> bool:
+        return self.state == "CLOSED" and len(self.commit_hashes) == 0
 
 
 #
@@ -227,12 +234,21 @@ class Main:
         commit_with_no_url: Commit | None = None
         commit_hashes_to_push_branch: list[str] = []
         for commit in reversed(commits):
-            if self.debug_force_push_branches or not commit.url:
+            if self.debug_force_push_branches:
+                commit_with_no_url = commit
+                break
+            elif not commit.url:
                 commit_with_no_url = commit
                 break
             else:
                 pr = prs_by_url[commit.url]
-                if pr.state == "MERGED" and pr.base_branch.startswith(BRANCH_PREFIX):
+                if pr.is_closed_and_non_openable():
+                    # If the PR is closed and has 0 commits, there is no way to
+                    # reopen it or update its base branch using GitHub API. So
+                    # we can only re-create such a PR.
+                    commit_with_no_url = commit
+                    break
+                if pr.is_accidentally_merged():
                     # If the PR was accidentally merged, we need to create a new
                     # PR for the commit, as if no PR existed at all.
                     commit_with_no_url = commit
@@ -262,7 +278,7 @@ class Main:
         # sequence is delayed till the next run, when the author has some other
         # updates to piggy-back likely.
         if not os.environ.get(INTERNAL_SKIP_UPDATE_PRS_VAR):
-            self.process_update_existing_prs(
+            self.process_update_existing_prs_from_commits_with_urls(
                 commits=commits,
                 commit_hashes_to_push_branch=commit_hashes_to_push_branch,
             )
@@ -318,14 +334,20 @@ class Main:
 
         new_pr_title = commit.title
         new_pr_body = None
-        new_pr_fixes_accidentally_merged_one = False
+        new_pr_is_instead_of = None
 
         if commit.url:
             pr = self.gh_get_pr(url=commit.url)
-            if pr.state == "MERGED" and pr.base_branch.startswith(BRANCH_PREFIX):
+            if pr.is_closed_and_non_openable():
+                self.print_pr_closed_and_non_openable_no_commits()
+                commit.url = None
+                new_pr_is_instead_of = "closed and non-openable"
+                new_pr_title = pr.title
+                new_pr_body = pr.body
+            elif pr.is_accidentally_merged():
                 self.print_pr_accidentally_merged()
                 commit.url = None
-                new_pr_fixes_accidentally_merged_one = True
+                new_pr_is_instead_of = "accidentally merged"
                 new_pr_title = pr.title
                 new_pr_body = pr.body
 
@@ -346,8 +368,8 @@ class Main:
             if result != "up-to-date":
                 self.print_pr_created(
                     comment=(
-                        "instead of accidentally merged"
-                        if new_pr_fixes_accidentally_merged_one
+                        f"instead of {new_pr_is_instead_of}"
+                        if new_pr_is_instead_of
                         else None
                     )
                 )
@@ -446,7 +468,7 @@ class Main:
     # Iterates over the list of commits with URLs and pushes their branches to
     # update the corresponding PRs.
     #
-    def process_update_existing_prs(
+    def process_update_existing_prs_from_commits_with_urls(
         self,
         *,
         commits: list[Commit],
@@ -548,6 +570,7 @@ class Main:
         return self.gh_update_pr(
             url=commit.url,
             base_branch=prev_commit.branch if prev_commit else None,
+            head_commit_hash=commit.hash,
             pr_numbers=pr_numbers,
             pr_number_current=pr_number_current,
         )
@@ -730,6 +753,7 @@ class Main:
         *,
         url: str,
         base_branch: str | None,
+        head_commit_hash: str,
         pr_numbers: list[int],
         pr_number_current: int | None,
     ) -> tuple[Pr, PrUpsertResult]:
@@ -757,8 +781,8 @@ class Main:
 
         if pr.state != "OPEN":
             upsert_result = "reopened"
-            self.shell(
-                [
+            returncode, output, stderr = self.shell_no_throw(
+                cmd := [
                     "gh",
                     "pr",
                     "reopen",
@@ -766,9 +790,46 @@ class Main:
                     "--comment",
                     "Reopened by git-grok.",
                 ],
-                input=new_body,
             )
-
+            if (
+                returncode != 0
+                and len(pr.commit_hashes) > 0
+                and "Could not open the pull request" in stderr
+            ):
+                # https://github.com/isaacs/github/issues/361 - "The XXX branch
+                # was force pushed or recreated". "We're blocking the pull
+                # request reopen if the current head isn't a descendant of the
+                # stored head sha (which is what the head was when the pull
+                # request was closed). We are not allowing the reopen in that
+                # case, because there is no good way to tell what changes have
+                # happened while a pull request was closed and the head branch
+                # has changed."
+                self.print_pr_closed_and_has_bad_head_branch()
+                temp_commit_hash = pr.commit_hashes[-1]
+                self.git_push_branches(
+                    branches=[Branch(hash=temp_commit_hash, branch=pr.head_branch)]
+                )
+                self.shell(
+                    [
+                        "gh",
+                        "pr",
+                        "reopen",
+                        url,
+                        "--comment",
+                        f"Hack: temporarily force-pushing the old commit {temp_commit_hash} to the head branch {pr.head_branch} and reopening by git-grok. "
+                        + "See https://github.com/isaacs/github/issues/361 for details.",
+                    ],
+                )
+                self.git_push_branches(
+                    branches=[Branch(hash=head_commit_hash, branch=pr.head_branch)]
+                )
+            elif returncode != 0:
+                raise CalledProcessError(
+                    returncode=returncode,
+                    cmd=cmd,
+                    output=output,
+                    stderr=stderr,
+                )
         self.shell(
             [
                 "gh",
@@ -818,7 +879,7 @@ class Main:
                     "view",
                     url,
                     "--json",
-                    "number,title,body,baseRefName,headRefName,url,reviewDecision,state,labels,autoMergeRequest",
+                    "number,title,body,baseRefName,headRefName,url,reviewDecision,state,labels,autoMergeRequest,commits",
                 ],
             ),
         )
@@ -834,6 +895,7 @@ class Main:
             state=value["state"],
             auto_merge_status="ENABLED" if value["autoMergeRequest"] else "DISABLED",
             labels=[label["name"] for label in value["labels"]],
+            commit_hashes=[c["oid"] for c in value["commits"]],
         )
 
     #
@@ -1193,6 +1255,22 @@ class Main:
         # the next stage), then they'll risk to lose the text! So we have no
         # choice but to force the user to wait.
         print(f"  ── new Pull Request created" + (f" ({comment})" if comment else ""))
+        sys.stdout.flush()
+
+    #
+    # Prints a "PR has bad branch" message.
+    #
+    def print_pr_closed_and_has_bad_head_branch(self):
+        print(f"  🧟 this closed PR has a bad head branch, so trying a hack")
+        sys.stdout.flush()
+
+    #
+    # Prints a "PR cannot be opened" message.
+    #
+    def print_pr_closed_and_non_openable_no_commits(self):
+        print(
+            f"  💀 this closed PR has 0 commits and cannot be reopened, so recreating"
+        )
         sys.stdout.flush()
 
     #
