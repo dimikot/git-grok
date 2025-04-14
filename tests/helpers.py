@@ -1,5 +1,6 @@
 from __future__ import annotations
 import json
+from pathlib import Path
 import re
 import shlex
 import sys
@@ -9,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from importlib.machinery import SourceFileLoader
 from importlib.util import spec_from_loader, module_from_spec
 from itertools import groupby
-from os import chdir, getcwd, mkdir, environ
+from os import chdir, getcwd, makedirs, environ
 from os.path import basename, dirname, realpath
 from platform import python_version
 from shutil import rmtree
@@ -68,8 +69,12 @@ def git_init_and_cd_to_test_dir(
     initial_branch: str,
     method: Literal["push.default", "set-upstream"],
 ):
-    rmtree(dir, ignore_errors=True)
-    mkdir(dir)
+    for path in Path(dir).glob("*"):
+        if path.is_dir():
+            rmtree(path)
+        else:
+            path.unlink()
+    makedirs(dir, exist_ok=True)
     chdir(dir)
     check_output_x("git", "init", f"--initial-branch={initial_branch}")
     check_output_x("git", "config", "user.name", "tests")

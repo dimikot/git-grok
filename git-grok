@@ -382,6 +382,14 @@ class Main:
             )
             if result != "up-to-date":
                 self.print_commit_message_updated()
+                updated_commit = self.git_get_commits(
+                    latest_ref="HEAD",
+                    count_back_in_time=1,
+                )[0]
+                self.git_assign_branch_to_hash(
+                    branch=commit.branch,
+                    hash=updated_commit.hash,
+                )
 
     #
     # Checks that the tool can process this stack of commits at all.
@@ -488,27 +496,38 @@ class Main:
                 commit.branch = self.process_commit_infer_branch(commit=commit)
                 to_push[commit.branch] = Branch(hash=commit.hash, branch=commit.branch)
 
-        push_results: dict[str, BranchPushResult] = {}
+        push_results = {}
+        if to_push and self.git_commits_were_not_reordered(commits=commits):
+            self.print_header(
+                f"Pushing {len(to_push)} PR head{'s' if len(to_push) > 1 else ''} atomically:"
+            )
+            push_results = self.git_push_branches(branches=[*to_push.values()])
+            for branch, result in push_results.items():
+                self.print_branch_result(
+                    type="head",
+                    branch=branch,
+                    result=result,
+                )
 
         for i, commit in enumerate(commits_old_to_new):
             self.print_header(f"Updating PR: {self.clean_title(commit.title)}")
 
-            # Push branches sequentially, one by one, not in bulk. This is
-            # because when bulk-pushing after local commits reordering, GitHub
-            # may mark some PRs as merged and close them (this behavior is
-            # covered with a unit test).
-            if commit.branch in to_push:
+            # If we did not push this branch yet (e.g. because the commits were
+            # reordered), push the branches sequentially, interleaving the
+            # pushes with PR updates. This minimizes the chance that GitHub will
+            # close some of PRs or mark them as merged in case of commits
+            # reordering (but it still may happen rarely, just unlikely).
+            if commit.branch in to_push and commit.branch not in push_results:
                 push_results.update(
                     self.git_push_branches(branches=[to_push[commit.branch]])
                 )
-
-            result = push_results.get(str(commit.branch), None)
-            if result == "pushed":
-                self.print_branch_result(
-                    type="head",
-                    branch=str(commit.branch),
-                    result=result,
-                )
+                result = push_results[commit.branch]
+                if result == "pushed":
+                    self.print_branch_result(
+                        type="head",
+                        branch=str(commit.branch),
+                        result=result,
+                    )
 
             pr, result = self.process_update_pr(
                 prev_commit=commits_old_to_new[i - 1] if i > 0 else None,
@@ -1009,6 +1028,20 @@ class Main:
         return results
 
     #
+    # Assigns the provided commit hash to the remote branch without pushing it.
+    # This is useful after e.g. changing the commit message.
+    #
+    def git_assign_branch_to_hash(self, *, branch: str, hash: str):
+        self.shell(
+            [
+                "git",
+                "update-ref",
+                f"refs/remotes/{self.remote}/{branch}",
+                f"{hash}",
+            ],
+        )
+
+    #
     # Runs an interactive rebase with the provided shell command.
     #
     def git_rebase_interactive_exec(
@@ -1060,6 +1093,24 @@ class Main:
             return "updated"
         else:
             return "up-to-date"
+
+    #
+    # Checks whether the order of the commits on top of the upstream remained
+    # the same since the last run. If so, we are e.g. allowed to push multiple
+    # branches in bulk, atomically.
+    #
+    def git_commits_were_not_reordered(self, *, commits: list[Commit]) -> bool:
+        latest_commit_branch = self.process_commit_infer_branch(commit=commits[0])
+        remote_commits = self.git_get_commits(
+            latest_ref=f"remotes/{self.remote}/{latest_commit_branch}",
+        )
+        commit_urls = [c.url for c in commits]
+        remote_commit_urls = [c.url for c in remote_commits]
+        self.debug_log_text(
+            text=f"Local URLs:  {str(commit_urls)}\n"
+            + f"Remote URLs: {str(remote_commit_urls)}"
+        )
+        return commit_urls == remote_commit_urls
 
     #
     # Runs a shell command returning results.
