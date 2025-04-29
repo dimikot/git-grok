@@ -214,6 +214,10 @@ def git_push():
     check_output_x("git", "push", "-f", "--set-upstream", TEST_REMOTE)
 
 
+def git_pull():
+    check_output_x("git", "pull", "--rebase")
+
+
 def git_get_prs(branch: str) -> str:
     return check_output_x(
         "gh",
@@ -228,7 +232,7 @@ def git_get_prs(branch: str) -> str:
     ).strip()
 
 
-def run_git_grok(*, skip_update_prs: bool = False):
+def run_git_grok(*, skip_update_existing_prs: bool = False) -> str:
     cmd = [GIT_GROK_PATH]
     with Popen(
         cmd,
@@ -238,11 +242,17 @@ def run_git_grok(*, skip_update_prs: bool = False):
         bufsize=1,
         env={
             **environ,
-            **({git_grok.INTERNAL_SKIP_UPDATE_PRS_VAR: "1"} if skip_update_prs else {}),
+            **(
+                {git_grok.INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR: "1"}
+                if skip_update_existing_prs
+                else {}
+            ),
         },
     ) as pipe:
+        out = ""
         assert pipe.stdout is not None
         for line in pipe.stdout:
+            out += line
             line = line.rstrip()
             if not line:
                 continue
@@ -251,6 +261,7 @@ def run_git_grok(*, skip_update_prs: bool = False):
         returncode = pipe.wait()
         if returncode != 0:
             raise CalledProcessError(returncode=returncode, cmd=cmd)
+        return out
 
 
 class TestCaseWithEmptyTestRepo(TestCase):

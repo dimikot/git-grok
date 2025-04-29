@@ -21,7 +21,7 @@ class Test(TestCaseWithEmptyTestRepo):
         git_add_commit("file-02-and-01")
         git_touch("file-03")
         git_add_commit("file-03-and-02-and-01")
-        run_git_grok(skip_update_prs=True)
+        run_git_grok(skip_update_existing_prs=True)
 
         hashes = git_log_get_hashes()
 

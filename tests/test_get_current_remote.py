@@ -13,13 +13,13 @@ class Test(TestCaseWithEmptyTestRepo):
         self.git_init_and_cd_to_test_dir(method="set-upstream")
         git_touch("commit01")
         git_add_commit("commit01")
-        run_git_grok(skip_update_prs=True)
+        run_git_grok(skip_update_existing_prs=True)
 
     def test_push_default(self):
         self.git_init_and_cd_to_test_dir(method="push.default")
         git_touch("commit01")
         git_add_commit("commit01")
-        run_git_grok(skip_update_prs=True)
+        run_git_grok(skip_update_existing_prs=True)
 
 
 if __name__ == "__main__":
