@@ -21,7 +21,7 @@ class Test(TestCaseWithEmptyTestRepo):
         git_touch("commit03")
         git_add_commit("commit03")
 
-        run_git_grok(skip_update_prs=True)
+        run_git_grok(skip_update_existing_prs=True)
         self.assertEqual(
             git_get_prs(self.initial_branch),
             dedent(

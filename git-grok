@@ -39,7 +39,9 @@ MIN_TITLE_LEN_IN_PRINT = 36
 TMP_BODY_FILE = "/tmp/git-grok.body"
 INTERNAL_ENV_VAR_PREFIX = "GIT_GROK"
 INTERNAL_IN_REBASE_INTERACTIVE_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_in_rebase_interactive"
-INTERNAL_SKIP_UPDATE_PRS_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_skip_update_prs"
+INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR = (
+    f"{INTERNAL_ENV_VAR_PREFIX}_skip_update_existing_prs"
+)
 DEBUG_FILE = "/tmp/git-grok.log"
 DEBUG_COLOR_GRAY_1 = (128, 128, 128)
 DEBUG_COLOR_GRAY_2 = (92, 92, 92)
@@ -68,6 +70,7 @@ class Commit:
     title: str
     description: str
     branch: str | None
+    decoration_branches: list[str]
 
 
 #
@@ -277,7 +280,7 @@ class Main:
         # - update commit message - push branch", but the last step of this
         # sequence is delayed till the next run, when the author has some other
         # updates to piggy-back likely.
-        if not os.environ.get(INTERNAL_SKIP_UPDATE_PRS_VAR):
+        if not os.environ.get(INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR):
             self.process_update_existing_prs_from_commits_with_urls(
                 commits=commits,
                 commit_hashes_to_push_branch=commit_hashes_to_push_branch,
@@ -936,20 +939,37 @@ class Main:
         if earliest_ref is None:
             earliest_ref = f"remotes/{self.remote}/{self.remote_base_branch}"
         if count_back_in_time:
-            out = self.shell(["git", "log", latest_ref, f"-{count_back_in_time}"])
+            out = self.shell(
+                ["git", "log", latest_ref, f"-{count_back_in_time}", "--decorate=short"]
+            )
         else:
-            out = self.shell(["git", "log", f"{earliest_ref}..{latest_ref}"])
+            out = self.shell(
+                ["git", "log", f"{earliest_ref}..{latest_ref}", "--decorate=short"]
+            )
         commits: list[Commit] = []
         for commit in re.split(r"^(?=commit )", out, flags=re.M)[1:]:
             try:
                 if not (
                     m := re.match(
-                        r"commit (\w+)[^\n]*\n(.*?)\n\n(.*)$", commit, flags=re.S
+                        r"commit (\w+)\s*(?:[(]([^)]*)[)])?[^\n]*\n(.*?)\n\n(.*)$",
+                        commit,
+                        flags=re.S,
                     )
                 ):
                     raise UserException("Can't parse commit-headers-body.")
 
-                hash, _headers, body = m.group(1), m.group(2), m.group(3).rstrip()
+                hash, decorations, _headers, body = (
+                    m.group(1),
+                    (m.group(2) or "").strip(),
+                    m.group(3),
+                    m.group(4).rstrip(),
+                )
+
+                decoration_branches = [
+                    re.sub(r"^.*->", "", v).strip()
+                    for v in decorations.split(",")
+                    if v.strip()
+                ]
 
                 if not (m := re.match(r"([^\n]+)\n?(.*)$", body, flags=re.S)):
                     raise UserException(f"Can't extract commit title and description.")
@@ -982,6 +1002,7 @@ class Main:
                     title=title,
                     description=description,
                     branch=None,
+                    decoration_branches=decoration_branches,
                 )
             )
         return commits
@@ -1101,17 +1122,37 @@ class Main:
     # branches in bulk, atomically.
     #
     def git_commits_were_not_reordered(self, *, commits: list[Commit]) -> bool:
-        latest_commit_branch = self.process_commit_infer_branch(commit=commits[0])
-        remote_commits = self.git_get_commits(
-            latest_ref=f"remotes/{self.remote}/{latest_commit_branch}",
-        )
-        commit_urls = [c.url for c in commits]
-        remote_commit_urls = [c.url for c in remote_commits]
+        local_commit_branches = [
+            commit.branch or self.process_commit_infer_branch(commit=commit)
+            for commit in commits
+        ]
+
+        remote_commit_branch_sets = [
+            set(
+                branch[len(self.remote + "/") :]
+                for branch in commit.decoration_branches
+                if branch.startswith(self.remote + "/")
+            )
+            for commit in self.git_get_commits(
+                latest_ref=f"remotes/{self.remote}/{local_commit_branches[0]}",
+            )
+        ]
+
         self.debug_log_text(
-            text=f"Local URLs:  {str(commit_urls)}\n"
-            + f"Remote URLs: {str(remote_commit_urls)}"
+            text=f"Local commits branches order:  {str([[b] for b in local_commit_branches])}\n"
+            + f"Remote commits branch order: {str(remote_commit_branch_sets)}"
         )
-        return commit_urls == remote_commit_urls
+
+        while local_commit_branches and remote_commit_branch_sets:
+            local_commit_branch = local_commit_branches.pop(0)
+            remote_commit_branch_set = remote_commit_branch_sets.pop(0)
+            if local_commit_branch not in remote_commit_branch_set:
+                return False
+
+        if local_commit_branches or remote_commit_branch_sets:
+            return False
+
+        return True
 
     #
     # Runs a shell command returning results.
@@ -1371,7 +1412,10 @@ class Main:
     #
     def debug_log_argv(self):
         text = shlex.join(sys.argv).strip()
-        for var in [INTERNAL_IN_REBASE_INTERACTIVE_VAR, INTERNAL_SKIP_UPDATE_PRS_VAR]:
+        for var in [
+            INTERNAL_IN_REBASE_INTERACTIVE_VAR,
+            INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR,
+        ]:
             value = os.environ.get(var)
             if value:
                 text = f"{var}={shlex.quote(value)} {text}"
