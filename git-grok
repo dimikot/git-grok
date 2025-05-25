@@ -305,7 +305,7 @@ class Main:
             raise UserException("The repository must have at least 2 commits")
         commit, prev_commit = commits[0], commits[1]
 
-        self.print_header(f"Processing commit: {self.clean_title(commit.title)}")
+        self.print_header(f"Processing commit: {clean_title(commit.title)}")
 
         to_push: list[Branch] = []
         if prev_commit.hash != remote_commit.hash:
@@ -513,7 +513,7 @@ class Main:
                 )
 
         for i, commit in enumerate(commits_old_to_new):
-            self.print_header(f"Updating PR: {self.clean_title(commit.title)}")
+            self.print_header(f"Updating PR: {clean_title(commit.title)}")
 
             # If we did not push this branch yet (e.g. because the commits were
             # reordered), push the branches sequentially, interleaving the
@@ -614,55 +614,6 @@ class Main:
     #
     def gh_get_current_login(self) -> str:
         return self.shell(["gh", "api", "user", "--jq", ".login"])
-
-    #
-    # Verifies Git version.
-    #
-    def git_verify_version(self):
-        self.shell_no_throw(["git", "--version"])
-
-    #
-    # Returns current git folder remote (most often "origin").
-    #
-    def git_get_current_remote(self) -> str:
-        [_, symbolic_ref, _] = self.shell_no_throw(
-            ["git", "symbolic-ref", "-q", "HEAD"]
-        )
-        if not symbolic_ref:
-            raise UserException(
-                'To run git-grok, you must be on a branch. Check your "git status".'
-            )
-        push_short = self.shell(
-            ["git", "for-each-ref", "--format=%(push:short)", symbolic_ref]
-        )
-        if not (m := re.match(r"^([^/]+)/.+$", push_short)):
-            raise UserException(
-                f'fatal: No configured push destination for symbolic ref "{symbolic_ref}".\n'
-                + "\n"
-                + "Git infers the current remote from the branch name using one of the following ways:\n"
-                + '1. It checks whether "git config branch.<branch>.remote" is set explicitly.\n'
-                + '2. Or, if "git config push.default" is "current" or "matching", there must be\n'
-                + "   only one remote configured.\n"
-            )
-        return m.group(1)
-
-    #
-    # Returns the current remote branch name on GitHub.
-    #
-    def git_get_current_remote_base_branch(self) -> str:
-        branch = self.shell(["git", "branch", "--show-current"])
-        if not branch:
-            path = ".git/rebase-merge/head-name"
-            if file := find_file_in_parents(path):
-                branch = open(file).readline().strip()
-                if not (m := re.match(r"refs/heads/(.+)", branch)):
-                    raise UserException(f"File {path} doesn't contain refs/heads/*")
-                branch = m.group(1)
-            else:
-                raise UserException(
-                    f"You must be on a branch or in an interactive rebase mode."
-                )
-        return branch
 
     #
     # Returns current git folder owner name and repository name.
@@ -920,6 +871,55 @@ class Main:
             labels=[label["name"] for label in value["labels"]],
             commit_hashes=[c["oid"] for c in value["commits"]],
         )
+
+    #
+    # Verifies Git version.
+    #
+    def git_verify_version(self):
+        self.shell_no_throw(["git", "--version"])
+
+    #
+    # Returns current git folder remote (most often "origin").
+    #
+    def git_get_current_remote(self) -> str:
+        [_, symbolic_ref, _] = self.shell_no_throw(
+            ["git", "symbolic-ref", "-q", "HEAD"]
+        )
+        if not symbolic_ref:
+            raise UserException(
+                'To run git-grok, you must be on a branch. Check your "git status".'
+            )
+        push_short = self.shell(
+            ["git", "for-each-ref", "--format=%(push:short)", symbolic_ref]
+        )
+        if not (m := re.match(r"^([^/]+)/.+$", push_short)):
+            raise UserException(
+                f'fatal: No configured push destination for symbolic ref "{symbolic_ref}".\n'
+                + "\n"
+                + "Git infers the current remote from the branch name using one of the following ways:\n"
+                + '1. It checks whether "git config branch.<branch>.remote" is set explicitly.\n'
+                + '2. Or, if "git config push.default" is "current" or "matching", there must be\n'
+                + "   only one remote configured.\n"
+            )
+        return m.group(1)
+
+    #
+    # Returns the current remote branch name on GitHub.
+    #
+    def git_get_current_remote_base_branch(self) -> str:
+        branch = self.shell(["git", "branch", "--show-current"])
+        if not branch:
+            path = ".git/rebase-merge/head-name"
+            if file := find_file_in_parents(path):
+                branch = open(file).readline().strip()
+                if not (m := re.match(r"refs/heads/(.+)", branch)):
+                    raise UserException(f"File {path} doesn't contain refs/heads/*")
+                branch = m.group(1)
+            else:
+                raise UserException(
+                    f"You must be on a branch or in an interactive rebase mode."
+                )
+        return branch
 
     #
     # Returns parsed commits between two refs in reverse-chronological order
@@ -1279,45 +1279,34 @@ class Main:
                 raise CalledProcessError(returncode=returncode, cmd=cmd)
 
     #
-    # Tries to self-update the tool by pulling from git.
+    # Caches the return value of a function in environment and returns it next time
+    # it's requested.
     #
-    def self_update(self):
-        dir = os.path.dirname(os.path.realpath(__file__))
-        if not os.path.exists(f"{dir}/.git"):
-            return
-        self.shell_no_throw(
-            ["sh", "-c", f"cd {shlex.quote(dir)} && git pull --rebase"],
-            comment="self-update",
-        )
+    def cache_through(self, key: str, func: Callable[[], str]) -> str:
+        key = hashify(key)
+        var = f"{INTERNAL_ENV_VAR_PREFIX}_{key}"
+        value = os.environ.get(var)
+        if value is None:
+            value = func()
+            os.environ[var] = value
+        else:
+            self.debug_log_shell_command(
+                cmd=["printenv", var],
+                env=None,
+                out=value,
+                took_s=0,
+                returncode=None,
+                comment="cache hit",
+            )
+        return value
 
     #
-    # Cleans a title from useless prefix/suffix.
+    # Removes the cached value for the key.
     #
-    def clean_title(self, title: str) -> str:
-        title = title.strip()
-        title = re.sub(r"^\w+[()\[\]\w]*:\s+", "", title)
-        title = re.sub(r"\[[-\w]+\]$", "", title)
-        title = title.strip()
-        max_len = max(
-            MIN_TITLE_LEN_IN_PRINT,
-            TERMINAL_SIZE.columns - 22,
-        )
-        if len(title) > max_len:
-            title = title[0:max_len] + "…"
-        return title
-
-    #
-    # Builds branch name from commit title.
-    #
-    def build_branch_name(self, *, title: str, commit_hash: str) -> str:
-        branch = title
-        branch = branch.strip()
-        branch = re.sub(r"\[[-\w]+\]$", "", branch)
-        branch = branch.lower()
-        branch = re.sub(r"^\W+|\W+$", "", branch)
-        branch = re.sub(r"\W+", "-", branch)
-        branch += f"-to-{self.remote_base_branch}-{commit_hash[0:4]}"
-        return f"{BRANCH_PREFIX}{self.login}/{branch}"
+    def cache_clean(self, key: str):
+        key = hashify(key)
+        var = f"{INTERNAL_ENV_VAR_PREFIX}_{key}"
+        os.environ.pop(var, None)
 
     #
     # Prints a status after a branch push attempt happened.
@@ -1530,34 +1519,29 @@ class Main:
             pass
 
     #
-    # Caches the return value of a function in environment and returns it next time
-    # it's requested.
+    # Tries to self-update the tool by pulling from git.
     #
-    def cache_through(self, key: str, func: Callable[[], str]) -> str:
-        key = hashify(key)
-        var = f"{INTERNAL_ENV_VAR_PREFIX}_{key}"
-        value = os.environ.get(var)
-        if value is None:
-            value = func()
-            os.environ[var] = value
-        else:
-            self.debug_log_shell_command(
-                cmd=["printenv", var],
-                env=None,
-                out=value,
-                took_s=0,
-                returncode=None,
-                comment="cache hit",
-            )
-        return value
+    def self_update(self):
+        dir = os.path.dirname(os.path.realpath(__file__))
+        if not os.path.exists(f"{dir}/.git"):
+            return
+        self.shell_no_throw(
+            ["sh", "-c", f"cd {shlex.quote(dir)} && git pull --rebase"],
+            comment="self-update",
+        )
 
     #
-    # Removes the cached value for the key.
+    # Builds branch name from commit title.
     #
-    def cache_clean(self, key: str):
-        key = hashify(key)
-        var = f"{INTERNAL_ENV_VAR_PREFIX}_{key}"
-        os.environ.pop(var, None)
+    def build_branch_name(self, *, title: str, commit_hash: str) -> str:
+        branch = title
+        branch = branch.strip()
+        branch = re.sub(r"\[[-\w]+\]$", "", branch)
+        branch = branch.lower()
+        branch = re.sub(r"^\W+|\W+$", "", branch)
+        branch = re.sub(r"\W+", "-", branch)
+        branch += f"-to-{self.remote_base_branch}-{commit_hash[0:4]}"
+        return f"{BRANCH_PREFIX}{self.login}/{branch}"
 
 
 #
@@ -1591,6 +1575,23 @@ def find_file_in_parents(file: str) -> str | None:
         old_path = path
         path = os.path.dirname(path)
     return None
+
+
+#
+# Cleans a title from useless prefix/suffix.
+#
+def clean_title(title: str) -> str:
+    title = title.strip()
+    title = re.sub(r"^\w+[()\[\]\w]*:\s+", "", title)
+    title = re.sub(r"\[[-\w]+\]$", "", title)
+    title = title.strip()
+    max_len = max(
+        MIN_TITLE_LEN_IN_PRINT,
+        TERMINAL_SIZE.columns - 22,
+    )
+    if len(title) > max_len:
+        title = title[0:max_len] + "…"
+    return title
 
 
 #
