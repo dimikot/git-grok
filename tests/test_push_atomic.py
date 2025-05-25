@@ -51,7 +51,7 @@ class Test(TestCaseWithEmptyTestRepo):
         git_add_commit("file-01")
         git_touch("file-02")
         git_add_commit("file-02")
-        run_git_grok(skip_update_existing_prs=True)
+        run_git_grok()
 
         git_pull()
 
