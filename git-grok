@@ -18,6 +18,8 @@ from subprocess import CalledProcessError, Popen, check_output
 from threading import Thread, current_thread, main_thread
 from time import time, sleep
 from typing import Callable, Literal, TypeVar, Generic
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 BRANCH_PREFIX = "grok/"
 PR_HEADER = "Pull Request"
@@ -36,16 +38,42 @@ BODY_SUFFIX_RE = (
 )
 MIN_BRANCH_LEN_IN_PRINT = 36
 MIN_TITLE_LEN_IN_PRINT = 36
-TMP_BODY_FILE = "/tmp/git-grok.body"
 INTERNAL_ENV_VAR_PREFIX = "GIT_GROK"
 INTERNAL_IN_REBASE_INTERACTIVE_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_in_rebase_interactive"
 INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR = (
     f"{INTERNAL_ENV_VAR_PREFIX}_skip_update_existing_prs"
 )
+SETTINGS_FILE = ".git/git-grok.json"
+PR_TEMPLATE_FILE = ".github/pull_request_template.md"
+TMP_BODY_FILE = "/tmp/git-grok.body"
 DEBUG_FILE = "/tmp/git-grok.log"
 DEBUG_COLOR_GRAY_1 = (128, 128, 128)
 DEBUG_COLOR_GRAY_2 = (92, 92, 92)
 GH_MIN_VERSION = "2.29.0"
+AI_WHO_YOU_ARE = """
+    You are a senior software engineer who writes professional, concise, and
+    informative pull request descriptions.
+"""
+AI_PROMPT = """
+    * NOW, FILL IN THE PULL REQUEST TEMPLATE WITH AN APPROPRIATE DESCRIPTION.
+    * Respond with only the completed PR description, so it can be used straight
+      away to create a pull request on GitHub.
+    * Do not try to fill any test steps or test plan in the PR description; only
+      fill the summary section, the description section or similar, where a
+      human-readable text is expected. Don't even write a single word in the
+      test steps section it it's provided.
+    * Leave an empty line between the end of the PR description you wrote and
+      the next section in the pull request template (if that next section
+      exists).
+    * Do not delete any sections from the resulting text, even if those sections
+      appear empty.
+    * Only append new text lines you wrote to the appropriate location (in ONE
+      contiguous block), never remove anything. You are not allowed to remove a
+      single character in the input pull request template! You can only add new
+      lines, never change sub-headers, surrounding text etc.
+    * Do not mention commit hashes in the PR description.
+"""
+AI_DEFAULT_PR_TEMPLATE = "## Summary\n\n## How was this tested?\n"
 
 try:
     TERMINAL_SIZE = os.get_terminal_size()
@@ -107,6 +135,24 @@ class Branch:
 
 
 #
+# Settings stored in a JSON file.
+#
+@dataclass
+class Settings:
+    ai_api_key: str
+    ai_model: str
+
+
+#
+# AI prompt information.
+#
+@dataclass
+class AiPrompt:
+    who_you_are: str
+    prompt: str
+
+
+#
 # Some data passed from the main process to each individual child process call
 # within "git rebase -i", for each commit in the stack.
 #
@@ -142,12 +188,14 @@ T = TypeVar("T")
 
 
 class Main:
+    settings: Settings | None = None
+    in_rebase_interactive: InRebaseInteractiveData | None = None
     debug: bool = False
     debug_force_push_branches: bool = False
+    debug_skip_update_existing_prs: bool = False
     login: str
     remote: str
     remote_base_branch: str = "master"
-    in_rebase_interactive: InRebaseInteractiveData | None = None
 
     #
     # Main entry point.
@@ -172,12 +220,17 @@ class Main:
         )
         args = parser.parse_args()
 
+        self.settings = load_settings()
+
         self.in_rebase_interactive = InRebaseInteractiveData.parse(
             os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR, "")
         )
 
         self.debug = args.debug
         self.debug_force_push_branches = args.debug_force_push_branches
+        self.debug_skip_update_existing_prs = bool(
+            os.environ.get(INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR)
+        )
 
         if not self.in_rebase_interactive:
             self.gh_verify_version()
@@ -280,7 +333,7 @@ class Main:
         # - update commit message - push branch", but the last step of this
         # sequence is delayed till the next run, when the author has some other
         # updates to piggy-back likely.
-        if not os.environ.get(INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR):
+        if not self.debug_skip_update_existing_prs:
             self.process_update_existing_prs_from_commits_with_urls(
                 commits=commits,
                 commit_hashes_to_push_branch=commit_hashes_to_push_branch,
@@ -358,6 +411,10 @@ class Main:
             assert (
                 commit.branch is not None
             ), f"commit {commit.hash} branch must be resolved"
+            if new_pr_body is None:
+                new_pr_body = self.process_build_pr_body_with_ai(
+                    commit_hash=commit.hash,
+                )
             url, result = self.gh_create_pr(
                 base_branch=prev_commit.branch,
                 head_branch=commit.branch,
@@ -374,7 +431,8 @@ class Main:
                         f"instead of {new_pr_is_instead_of}"
                         if new_pr_is_instead_of
                         else None
-                    )
+                    ),
+                    debug_url=url if self.debug_skip_update_existing_prs else None,
                 )
             commit.url = url
 
@@ -598,6 +656,37 @@ class Main:
         )
 
     #
+    # Builds PR body with AI (or returns the content of the PR template file).
+    #
+    def process_build_pr_body_with_ai(
+        self,
+        *,
+        commit_hash: str,
+    ) -> str:
+        template_file = find_file_in_parents(PR_TEMPLATE_FILE)
+        if template_file:
+            with open(template_file) as file:
+                pr_template = file.read()
+        else:
+            pr_template = None
+
+        if not self.settings:
+            return pr_template or ""
+
+        self.print_ai_generating()
+
+        prompt = self.ai_build_prompt(
+            diff=self.git_get_commit_diff(commit_hash=commit_hash),
+            files=self.git_get_commit_files(commit_hash=commit_hash),
+            pr_template=pr_template or AI_DEFAULT_PR_TEMPLATE,
+        )
+        return self.ai_generate_pr_description(
+            api_key=self.settings.ai_api_key,
+            model=self.settings.ai_model,
+            prompt=prompt,
+        )
+
+    #
     # Verifies that the gh supports e.g. autoMergeRequest field.
     #
     def gh_verify_version(self):
@@ -666,18 +755,15 @@ class Main:
         base_branch: str | None,
         head_branch: str,
         title: str,
-        body: str | None,
+        body: str,
         is_middle_pr: bool,
     ) -> tuple[str, PrUpsertResult]:
         if not base_branch:
             base_branch = self.remote_base_branch
 
-        if body is not None:
-            body_file = TMP_BODY_FILE
-            with open(body_file, "w+") as file:
-                file.write(body)
-        else:
-            body_file = find_file_in_parents(".github/pull_request_template.md")
+        body_file = TMP_BODY_FILE
+        with open(body_file, "w+") as file:
+            file.write(body)
 
         cmd = [
             "gh",
@@ -690,7 +776,8 @@ class Main:
             *(["--label", MIDDLE_PR_LABEL] if is_middle_pr else []),
             "--title",
             title,
-            *(["--body-file", body_file] if body_file else ["--body", ""]),
+            "--body-file",
+            body_file,
         ]
 
         attempt = 0
@@ -1008,6 +1095,18 @@ class Main:
         return commits
 
     #
+    # Returns the diff of the provided commit.
+    #
+    def git_get_commit_diff(self, *, commit_hash: str) -> str:
+        return self.shell(["git", "show", commit_hash])
+
+    #
+    # Returns the full contents of the files affected by the provided commit.
+    #
+    def git_get_commit_files(self, *, commit_hash: str) -> dict[str, str]:
+        return {}
+
+    #
     # Pushes multiple branches atomically to remote GitHub. Returns a dict
     # mapping branch names to their push results.
     #
@@ -1153,6 +1252,69 @@ class Main:
             return False
 
         return True
+
+    #
+    # Builds a prompt for the AI to generate a PR description.
+    #
+    def ai_build_prompt(
+        self,
+        *,
+        diff: str,
+        files: dict[str, str],
+        pr_template: str,
+    ) -> AiPrompt:
+        sep = "-" * 60
+        files_content = f"\n{sep[0:len(sep)//2]}\n".join(
+            f"Filename: {name.strip()}\n{content.strip()}"
+            for name, content in files.items()
+        )
+        diff = diff.strip() + "\n" if diff.strip() else ""
+        pr_template = pr_template.strip() + "\n" if pr_template.strip() else ""
+        files_content = files_content.strip() + "\n" if files_content.strip() else ""
+        return AiPrompt(
+            who_you_are=unindent(AI_WHO_YOU_ARE),
+            prompt=(
+                f"Here is the pull_request_template.md developers use:\n{sep}\n{pr_template}{sep}\n\n"
+                + f"Here is the git diff:\n{sep}\n{diff}{sep}\n\n"
+                + f"Here are the full contents of the affected files:\n{sep}\n{files_content}{sep}\n\n"
+                + unindent(AI_PROMPT)
+            ),
+        )
+
+    #
+    # Generates a PR description using AI.
+    #
+    def ai_generate_pr_description(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        prompt: AiPrompt,
+    ) -> str:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": prompt.who_you_are},
+                {"role": "user", "content": prompt.prompt},
+            ],
+            "temperature": 0.5,
+            "max_tokens": 800,
+        }
+        try:
+            with urlopen(
+                Request(
+                    "https://api.openai.com/v1/chat/completions",
+                    data=json.dumps(payload).encode(),
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                )
+            ) as resp:
+                data = json.load(resp)
+                return data["choices"][0]["message"]["content"].strip()
+        except HTTPError as e:
+            raise UserException(f"{e.code} {e.reason}: {e.read().decode()}")
 
     #
     # Runs a shell command returning results.
@@ -1328,15 +1490,33 @@ class Main:
         sys.stdout.flush()
 
     #
+    # Prints a "Generating with AI" message.
+    #
+    def print_ai_generating(self):
+        print("  ── generating PR description with AI (patience!)")
+        sys.stdout.flush()
+
+    #
     # Prints a "PR created" message.
     #
-    def print_pr_created(self, *, comment: str | None = None):
-        # ATTENTION: we DO NOT print the newly created PR URL here, because it
-        # lacks the footer with links to all other PRs in the stack yet. If
-        # someone starts editing it before that footer is added (later, during
-        # the next stage), then they'll risk to lose the text! So we have no
-        # choice but to force the user to wait.
-        print(f"  ── new Pull Request created" + (f" ({comment})" if comment else ""))
+    def print_pr_created(
+        self,
+        *,
+        comment: str | None = None,
+        debug_url: str | None = None,
+    ):
+        # ATTENTION: we DO NOT print the newly created PR URL here (except for
+        # debugging or tests purposes), because it lacks the footer with links
+        # to all other PRs in the stack yet. If someone starts editing it before
+        # that footer is added (later, during the next stage), then they'll risk
+        # to lose the text! So we have no choice but to force the user to wait.
+        # The URL will anyway be printed at the "Updating PR" stage, we don't
+        # need to double-print it.
+        print(
+            f"  ── new Pull Request created"
+            + (f" ({comment})" if comment else "")
+            + (f": {debug_url}" if debug_url else "")
+        )
         sys.stdout.flush()
 
     #
@@ -1545,6 +1725,27 @@ class Main:
 
 
 #
+# Loads settings from a JSON file.
+#
+def load_settings() -> Settings | None:
+    path = find_file_in_parents(SETTINGS_FILE)
+    if not path:
+        return None
+    with open(path, "r") as f:
+        data = json.load(f)
+        if not isinstance(data, dict):
+            raise UserException(f"Invalid settings file: {path}")
+        elif "ai_api_key" not in data or not isinstance(data["ai_api_key"], str):
+            raise UserException(f"No string key ai_api_key in settings file: {path}")
+        elif "ai_model" not in data or not isinstance(data["ai_model"], str):
+            raise UserException(f"No string key ai_model in settings file: {path}")
+        return Settings(
+            ai_api_key=data["ai_api_key"],
+            ai_model=data["ai_model"],
+        )
+
+
+#
 # Splits a list into chunks of size n.
 #
 def chunk(lst: list[T], n: int) -> list[list[T]]:
@@ -1592,6 +1793,17 @@ def clean_title(title: str) -> str:
     if len(title) > max_len:
         title = title[0:max_len] + "…"
     return title
+
+
+#
+# Removes common leading whitespace from each line.
+#
+def unindent(text: str) -> str:
+    text = re.sub(r"^([ \t\r]*\n)+", "", text, flags=re.S).rstrip()
+    matches = re.match(r"^[ \t]+", text, flags=re.S)
+    if matches:
+        text = re.sub(f"^{matches.group(0)}", "", text, flags=re.M)
+    return text
 
 
 #
