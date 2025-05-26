@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -17,7 +18,9 @@ from itertools import dropwhile
 from subprocess import CalledProcessError, Popen, check_output
 from threading import Thread, current_thread, main_thread
 from time import time, sleep
-from typing import Callable, Literal, TypeVar, Generic
+from typing import Any, Callable, Literal, TypeVar, Generic, cast
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 
 BRANCH_PREFIX = "grok/"
 PR_HEADER = "Pull Request"
@@ -36,16 +39,108 @@ BODY_SUFFIX_RE = (
 )
 MIN_BRANCH_LEN_IN_PRINT = 36
 MIN_TITLE_LEN_IN_PRINT = 36
-TMP_BODY_FILE = "/tmp/git-grok.body"
 INTERNAL_ENV_VAR_PREFIX = "GIT_GROK"
 INTERNAL_IN_REBASE_INTERACTIVE_VAR = f"{INTERNAL_ENV_VAR_PREFIX}_in_rebase_interactive"
 INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR = (
     f"{INTERNAL_ENV_VAR_PREFIX}_skip_update_existing_prs"
 )
+SETTINGS_FILE = ".git/git-grok.json"
+PR_TEMPLATE_FILE = ".github/pull_request_template.md"
+TMP_BODY_FILE = "/tmp/git-grok.body"
 DEBUG_FILE = "/tmp/git-grok.log"
 DEBUG_COLOR_GRAY_1 = (128, 128, 128)
 DEBUG_COLOR_GRAY_2 = (92, 92, 92)
 GH_MIN_VERSION = "2.29.0"
+AI_MAX_REMEMBERED_SNIPPETS = 50
+AI_PLACEHOLDER = "<!--AI-->"
+AI_SEPARATOR = "=" * 20
+AI_DIFF_CONTEXT_LINES = 100
+AI_WHO_YOU_ARE = """
+    You are a senior software engineer who writes professional, concise, and
+    informative pull request descriptions.
+"""
+AI_PROMPT = f"""
+    # Response format
+
+    The response MUST consist of EXACTLY 2 parts separated by the EXACT
+    "{AI_SEPARATOR}" marker located on a separate line. Those 2 parts are:
+    Modified PR Template and Pull Request Summary.
+
+    ## 1st Part: Modified PR Template
+
+    - The 1st part of the response is the exact text of the PR template that I
+      passed in the input, BUT with "{AI_PLACEHOLDER}" marker injected on a
+      separate line at the place where it will make sense to insert the Pull
+      Request Summary later.
+    - Your goal is to detect the single best place for this "{AI_PLACEHOLDER}"
+      marker injection and inject it there. At the place where a human-readable
+      summary would be expected.
+    - You are not allowed to remove a single character in the PR template!
+    - Never change sub-headers, surrounding text etc. there.
+    - Do not delete any sections, even if those sections appear empty.
+    - Only include the response text in that part. Don't add any comments or
+      thoughts, just the text of the PR template with the "{AI_PLACEHOLDER}"
+      marker injected at the best place.
+
+    ## 2nd Part: Pull Request Summary
+
+    - The 2nd part of the response must be a concise, informative, and
+      professional pull request summary. When building, infer the information
+      from the PR title and the diff provided. Don't be too short, but also
+      don't be too verbose: the result should be pleasant for a human engineer
+      to read and understand.
+    - Use PR title; it is provided as a hint for the PRIMARY ESSENCE of the
+      change in the diff (especially when unsure, or when there are multiple
+      unrelated changes in the diff). The title is manually created by the diff
+      author, so it must be good enough.
+    - Do not duplicate the title in the Pull Request Summary! E.g. don't say
+      something like "This pull request titled "..." does ...". The title
+      information is already in the PR title, no sense in duplicating it in the
+      summary.
+    - ALWAYS start the Pull Request Summary text with a present continuous verb,
+      e.g. "Adding XYZ", "Fixing XYZ" or any other present continuous verb that
+      is best suitable there.
+    - NEVER MENTION COMMIT SHA HASHES! NEVER MENTION COMMIT SHA HASH PREFIXES!
+      Especially in backtick-quotes. Those hashes are ephemeral, it makes no
+      sense to include them in the summary.
+    - NEVER TRY TO FILL ANY TEST STEPS OR TEST PLAN in the summary; only build
+      human-readable text. Your goal is NOT to create test plans. Your goal is
+      to only fill the human readable summary of the change.
+    - Avoid pompous phrases like "This is a crucial step", "This change is
+      foundational" etc.
+    - DON'T HALLUCINATE! If you're not sure about something, better not mention
+      it than hallucinate. Again, try to infer hints from the PR title.
+
+    ### Ending of the 2nd Part: Essential Code Lines (Optional)
+
+    - In the end of the 2nd part text, extract 1-5 most "essential code lines"
+      from the diff and mention these extracted lines in a code block (markdown;
+      use the language tag in triple-backtick syntax).
+    - Make sure that those "essential code lines" ARE SOMEHOW RELATED to the PR
+      title provided. Typically, when author of a PR writes its title, it has
+      some essential code lines in mind; try to infer them based on the title if
+      possible or when unsure.
+    - If there is nothing interesting to extract, or if the markdown code
+      triple-backtick text you're about to inject is empty, simply skip this
+      ending of block 2 and don't even mention that it's absent (since it's
+      optional).
+    - Otherwise, give the corresponding explanation of the Essential Code Lines
+      as well (in a very short form).
+    - Avoid pompous phrases like "This is a crucial step", "This change is
+      foundational" etc.
+    - NEVER TREAT import (or module inclusion, require etc.) statements as
+      Essential Code Lines (i.e. whatever is a common boilerplate, should be
+      disregarded). The idea is to not overload the description with code
+      samples, but still highlight the most important part of the diff, its
+      ESSENCE.
+    - In the Essential Code lines, remember that your input is a diff, so most
+      of the lines will have "+" or "-" prefix. You must remove that prefixes,
+      so only the code snippet remains.
+"""
+AI_DEFAULT_PR_TEMPLATE = "## Summary\n\n## How was this tested?\n"
+AI_DEFAULT_MODEL = "gpt-4o-mini"
+AI_DEFAULT_MAX_TOKENS = 800
+AI_DEFAULT_TEMPERATURE = 0.2
 
 try:
     TERMINAL_SIZE = os.get_terminal_size()
@@ -107,6 +202,38 @@ class Branch:
 
 
 #
+# Settings stored in a JSON file.
+#
+@dataclass
+class Settings:
+    ai_api_key: str
+    ai_model: str
+    ai_max_tokens: int
+    ai_temperature: float
+    ai_generated_snippets: list[str]
+
+
+#
+# AI prompt information.
+#
+@dataclass
+class AiPrompt:
+    who_you_are: str
+    prompt: str
+    input: str
+
+
+#
+# An AI-injected text, which is a template with AI_PLACEHOLDER, plus a
+# replacement text for that placeholder.
+#
+@dataclass
+class AiInjectedText:
+    template_with_placeholder: str
+    text: str
+
+
+#
 # Some data passed from the main process to each individual child process call
 # within "git rebase -i", for each commit in the stack.
 #
@@ -142,12 +269,14 @@ T = TypeVar("T")
 
 
 class Main:
+    settings: Settings | None = None
+    in_rebase_interactive: InRebaseInteractiveData | None = None
     debug: bool = False
     debug_force_push_branches: bool = False
+    debug_skip_update_existing_prs: bool = False
     login: str
     remote: str
     remote_base_branch: str = "master"
-    in_rebase_interactive: InRebaseInteractiveData | None = None
 
     #
     # Main entry point.
@@ -172,12 +301,17 @@ class Main:
         )
         args = parser.parse_args()
 
+        self.settings_load()
+
         self.in_rebase_interactive = InRebaseInteractiveData.parse(
             os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR, "")
         )
 
         self.debug = args.debug
         self.debug_force_push_branches = args.debug_force_push_branches
+        self.debug_skip_update_existing_prs = bool(
+            os.environ.get(INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR)
+        )
 
         if not self.in_rebase_interactive:
             self.gh_verify_version()
@@ -280,7 +414,7 @@ class Main:
         # - update commit message - push branch", but the last step of this
         # sequence is delayed till the next run, when the author has some other
         # updates to piggy-back likely.
-        if not os.environ.get(INTERNAL_SKIP_UPDATE_EXISTING_PRS_VAR):
+        if not self.debug_skip_update_existing_prs:
             self.process_update_existing_prs_from_commits_with_urls(
                 commits=commits,
                 commit_hashes_to_push_branch=commit_hashes_to_push_branch,
@@ -358,6 +492,17 @@ class Main:
             assert (
                 commit.branch is not None
             ), f"commit {commit.hash} branch must be resolved"
+            if new_pr_body is None:
+                template_file = find_file_in_parents(PR_TEMPLATE_FILE)
+                if template_file:
+                    with open(template_file) as file:
+                        pr_template = file.read()
+                else:
+                    pr_template = None
+                new_pr_body = self.process_build_pr_body_with_ai(
+                    commit=commit,
+                    pr_template=pr_template,
+                )
             url, result = self.gh_create_pr(
                 base_branch=prev_commit.branch,
                 head_branch=commit.branch,
@@ -374,7 +519,8 @@ class Main:
                         f"instead of {new_pr_is_instead_of}"
                         if new_pr_is_instead_of
                         else None
-                    )
+                    ),
+                    debug_url=url if self.debug_skip_update_existing_prs else None,
                 )
             commit.url = url
 
@@ -588,14 +734,61 @@ class Main:
                 pr_numbers.append(int(m.group(1)))
                 if c.hash == commit.hash:
                     pr_number_current = int(m.group(1))
+
         assert commit.url is not None
+        pr = self.gh_get_pr(url=commit.url)
+
+        self.settings_load()
+        if self.settings:
+            injected_text = body_convert_to_injected_text(
+                body=pr.body,
+                ai_generated_snippets=self.settings.ai_generated_snippets,
+            )
+            if injected_text is not None:
+                rules_hash = ai_hash_extract(injected_text.text)
+                if rules_hash != self.ai_get_rules_hash():
+                    commit.title = pr.title
+                    pr.body = self.process_build_pr_body_with_ai(
+                        commit=commit,
+                        pr_template=injected_text.template_with_placeholder,
+                    )
+
         return self.gh_update_pr(
-            url=commit.url,
+            pr=pr,
             base_branch=prev_commit.branch if prev_commit else None,
             head_commit_hash=commit.hash,
             pr_numbers=pr_numbers,
             pr_number_current=pr_number_current,
         )
+
+    #
+    # Builds PR body with AI (or returns the content of the PR template file).
+    #
+    def process_build_pr_body_with_ai(
+        self,
+        *,
+        commit: Commit,
+        pr_template: str | None,
+    ) -> str:
+        if not self.settings:
+            return pr_template or ""
+
+        self.print_ai_generating()
+
+        prompt = self.ai_build_prompt(
+            title=commit.title,
+            diff=self.git_get_commit_diff(commit_hash=commit.hash),
+            pr_template=pr_template or AI_DEFAULT_PR_TEMPLATE,
+        )
+        injected_text = self.ai_generate_injected_text(
+            api_key=self.settings.ai_api_key,
+            model=self.settings.ai_model,
+            prompt=prompt,
+        )
+        self.settings.ai_generated_snippets.insert(0, injected_text.text)
+        self.settings_merge_save()
+
+        return body_build_from_injected_text(injected_text=injected_text)
 
     #
     # Verifies that the gh supports e.g. autoMergeRequest field.
@@ -666,18 +859,15 @@ class Main:
         base_branch: str | None,
         head_branch: str,
         title: str,
-        body: str | None,
+        body: str,
         is_middle_pr: bool,
     ) -> tuple[str, PrUpsertResult]:
         if not base_branch:
             base_branch = self.remote_base_branch
 
-        if body is not None:
-            body_file = TMP_BODY_FILE
-            with open(body_file, "w+") as file:
-                file.write(body)
-        else:
-            body_file = find_file_in_parents(".github/pull_request_template.md")
+        body_file = TMP_BODY_FILE
+        with open(body_file, "w+") as file:
+            file.write(body)
 
         cmd = [
             "gh",
@@ -690,7 +880,8 @@ class Main:
             *(["--label", MIDDLE_PR_LABEL] if is_middle_pr else []),
             "--title",
             title,
-            *(["--body-file", body_file] if body_file else ["--body", ""]),
+            "--body-file",
+            body_file,
         ]
 
         attempt = 0
@@ -724,7 +915,7 @@ class Main:
     def gh_update_pr(
         self,
         *,
-        url: str,
+        pr: Pr,
         base_branch: str | None,
         head_commit_hash: str,
         pr_numbers: list[int],
@@ -733,8 +924,11 @@ class Main:
         if base_branch is None:
             base_branch = self.remote_base_branch
 
-        pr = self.gh_get_pr(url=url)
-        new_body = body_suffix_upsert(pr.body, pr_numbers, pr_number_current)
+        new_body = body_suffix_upsert(
+            body=pr.body,
+            pr_numbers=pr_numbers,
+            pr_number_current=pr_number_current,
+        )
         is_middle_pr = len(pr_numbers) > 0 and pr.number not in (
             pr_numbers[0],
             pr_numbers[-1],
@@ -748,7 +942,7 @@ class Main:
         ):
             return pr, "up-to-date"
 
-        self.cache_clean(url)
+        self.cache_clean(pr.url)
 
         upsert_result = "updated"
 
@@ -759,7 +953,7 @@ class Main:
                     "gh",
                     "pr",
                     "reopen",
-                    url,
+                    pr.url,
                     "--comment",
                     "Reopened by git-grok.",
                 ],
@@ -788,7 +982,7 @@ class Main:
                         "gh",
                         "pr",
                         "reopen",
-                        url,
+                        pr.url,
                         "--comment",
                         f"Hack: temporarily force-pushing the old commit {temp_commit_hash} to the head branch {pr.head_branch} and reopening by git-grok. "
                         + "See https://github.com/isaacs/github/issues/361 for details.",
@@ -809,7 +1003,7 @@ class Main:
                 "gh",
                 "pr",
                 "edit",
-                url,
+                pr.url,
                 "--base",
                 base_branch,
                 *(
@@ -1008,6 +1202,12 @@ class Main:
         return commits
 
     #
+    # Returns the diff of the provided commit.
+    #
+    def git_get_commit_diff(self, *, commit_hash: str) -> str:
+        return self.shell(["git", "show", f"-U{AI_DIFF_CONTEXT_LINES}", commit_hash])
+
+    #
     # Pushes multiple branches atomically to remote GitHub. Returns a dict
     # mapping branch names to their push results.
     #
@@ -1139,8 +1339,10 @@ class Main:
         ]
 
         self.debug_log_text(
-            text=f"Local commits branches order:  {str([[b] for b in local_commit_branches])}\n"
-            + f"Remote commits branch order: {str(remote_commit_branch_sets)}"
+            text=[
+                f"Local commits branches order:  {str([[b] for b in local_commit_branches])}",
+                f"Remote commits branch order: {str(remote_commit_branch_sets)}",
+            ]
         )
 
         while local_commit_branches and remote_commit_branch_sets:
@@ -1153,6 +1355,115 @@ class Main:
             return False
 
         return True
+
+    #
+    # Returns a hash based on the static part of the prompt ("rules"). Injecting
+    # this hash as a part of the AI-generated snippet allows to improve the AI
+    # prompt text when developing git-grok, as a part of dog-food feedback loop.
+    # E.g. if we modify AI_PROMPT and rerun git-grok for a stack, then the tool
+    # will update all the existing PRs with a newly generated text (and if no
+    # changes in AI_PROMPT happened, or there is no AI-generated snippet found
+    # in the PR at all, then the PR body will be left untouched).
+    #
+    def ai_get_rules_hash(self) -> str:
+        return short_hash(
+            "\n".join(
+                [
+                    self.settings.ai_model if self.settings else "",
+                    str(self.settings.ai_max_tokens if self.settings else ""),
+                    str(self.settings.ai_temperature if self.settings else ""),
+                    str(AI_DIFF_CONTEXT_LINES),
+                    unindent(AI_WHO_YOU_ARE),
+                    unindent(AI_PROMPT).rstrip(),
+                ]
+            )
+        )
+
+    #
+    # Builds a prompt for the AI to generate a PR description.
+    #
+    def ai_build_prompt(
+        self,
+        *,
+        title: str,
+        diff: str,
+        pr_template: str,
+    ) -> AiPrompt:
+        sep = "-" * 60
+        diff = diff.strip() + "\n" if diff.strip() else ""
+        pr_template = pr_template.strip() + "\n" if pr_template.strip() else ""
+        who_you_are = unindent(AI_WHO_YOU_ARE).rstrip()
+        prompt = unindent(AI_PROMPT).rstrip()
+        input = (
+            f"Here is the PR title:\n{sep}\n{title.strip()}{sep}\n\n"
+            + f"Here is the {PR_TEMPLATE_FILE} developers use:\n{sep}\n{pr_template}{sep}\n\n"
+            + f"Here is the git diff:\n{sep}\n{diff}{sep}\n\n"
+        ).rstrip()
+        return AiPrompt(
+            who_you_are=who_you_are,
+            prompt=prompt,
+            input=input,
+        )
+
+    #
+    # Generates an injected text block (like PR summary).
+    #
+    def ai_generate_injected_text(
+        self,
+        *,
+        api_key: str,
+        model: str,
+        prompt: AiPrompt,
+    ) -> AiInjectedText:
+        assert self.settings
+        data = json.dumps(
+            {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": prompt.who_you_are},
+                    {"role": "system", "content": prompt.prompt},
+                    {"role": "user", "content": prompt.input},
+                ],
+                "temperature": self.settings.ai_temperature,
+                "max_tokens": self.settings.ai_max_tokens,
+            },
+            indent=2,
+        )
+        req = Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=data.encode(),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        time_start = time()
+        res = None
+        returncode = None
+        try:
+            with urlopen(req) as res:
+                res = json.load(res)
+                res = str(res["choices"][0]["message"]["content"].strip())
+                parts = [part.strip() for part in res.split(AI_SEPARATOR)]
+                if len(parts) != 2:
+                    raise UserException(f"Invalid response from AI:\n[[[\n{res}\n]]]")
+                return AiInjectedText(
+                    template_with_placeholder=parts[0],
+                    text=ai_hash_build(self.ai_get_rules_hash()) + "\n" + parts[1],
+                )
+        except HTTPError as e:
+            res = e.read().decode()
+            returncode = e.code
+            raise UserException(f"{e.code} {e.reason}: {res}")
+        finally:
+            self.debug_log_shell_command(
+                cmd=["curl", "-X", "POST", req.full_url],
+                input=data.strip(),
+                env=None,
+                out=str(res),
+                took_s=time() - time_start,
+                returncode=returncode,
+            )
 
     #
     # Runs a shell command returning results.
@@ -1279,6 +1590,87 @@ class Main:
                 raise CalledProcessError(returncode=returncode, cmd=cmd)
 
     #
+    # Loads settings from a JSON file.
+    #
+    def settings_load(self):
+        self.settings = None
+        if not (path := find_file_in_parents(SETTINGS_FILE)):
+            return
+        with open(path, "r") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                data = json.loads(f.read())
+                if not isinstance(data, dict):
+                    raise UserException(f"Settings must be a JSON object")
+
+                data = cast(dict[str, Any], data)
+                ai_api_key = data.get("ai_api_key", None)
+                ai_model = data.get("ai_model", AI_DEFAULT_MODEL)
+                ai_max_tokens = data.get("ai_max_tokens", AI_DEFAULT_MAX_TOKENS)
+                ai_temperature = data.get("ai_temperature", AI_DEFAULT_TEMPERATURE)
+                ai_generated_snippets = data.get("ai_generated_snippets", [])
+
+                if not isinstance(ai_api_key, str):
+                    raise UserException(f"No string key ai_api_key")
+                if not isinstance(ai_model, str):
+                    raise UserException(f"Invalid type for ai_model (must be a string)")
+                if not isinstance(ai_max_tokens, int):
+                    raise UserException(
+                        f"Invalid type for ai_max_tokens (must be an int)"
+                    )
+                if not isinstance(ai_temperature, float) and not isinstance(
+                    ai_temperature, int
+                ):
+                    raise UserException(
+                        f"Invalid type for ai_temperature (must be a float or int)"
+                    )
+                if not isinstance(ai_generated_snippets, list) or not all(
+                    isinstance(s, str) for s in cast(list[Any], ai_generated_snippets)
+                ):
+                    raise UserException(
+                        f"Invalid type for ai_generated_snippets (must be a list of strings)"
+                    )
+            except UserException as e:
+                raise UserException(f"{e} in settings file {path}")
+            self.settings = Settings(
+                ai_api_key=ai_api_key,
+                ai_model=ai_model,
+                ai_max_tokens=ai_max_tokens,
+                ai_temperature=float(ai_temperature),
+                ai_generated_snippets=cast(list[str], ai_generated_snippets or []),
+            )
+
+    #
+    # Saves the dynamic part of the settings to a JSON file.
+    #
+    def settings_merge_save(self):
+        if not self.settings:
+            return
+        search_dir = os.path.dirname(SETTINGS_FILE)
+        if not (dir := find_file_in_parents(search_dir)):
+            raise UserException(
+                f"Failed to find {search_dir} in parents to store settings"
+            )
+        path = f"{dir}/{os.path.basename(SETTINGS_FILE)}"
+        with open(path, "a+") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            f.seek(0)
+            data = json.loads(f.read())
+            if not isinstance(data, dict):
+                raise UserException(f"Settings must be a JSON object: {path}")
+            data = cast(dict[str, Any], data)
+            data["ai_generated_snippets"] = [
+                *self.settings.ai_generated_snippets,
+                *(
+                    set(data.get("ai_generated_snippets", []))
+                    - set(self.settings.ai_generated_snippets)
+                ),
+            ][:AI_MAX_REMEMBERED_SNIPPETS]
+            f.seek(0)
+            f.truncate()
+            f.write(f"{json.dumps(data, indent=2)}\n")
+
+    #
     # Caches the return value of a function in environment and returns it next time
     # it's requested.
     #
@@ -1328,15 +1720,33 @@ class Main:
         sys.stdout.flush()
 
     #
+    # Prints a "Generating with AI" message.
+    #
+    def print_ai_generating(self):
+        print("  ── generating PR description with AI (patience!)")
+        sys.stdout.flush()
+
+    #
     # Prints a "PR created" message.
     #
-    def print_pr_created(self, *, comment: str | None = None):
-        # ATTENTION: we DO NOT print the newly created PR URL here, because it
-        # lacks the footer with links to all other PRs in the stack yet. If
-        # someone starts editing it before that footer is added (later, during
-        # the next stage), then they'll risk to lose the text! So we have no
-        # choice but to force the user to wait.
-        print(f"  ── new Pull Request created" + (f" ({comment})" if comment else ""))
+    def print_pr_created(
+        self,
+        *,
+        comment: str | None = None,
+        debug_url: str | None = None,
+    ):
+        # ATTENTION: we DO NOT print the newly created PR URL here (except for
+        # debugging or tests purposes), because it lacks the footer with links
+        # to all other PRs in the stack yet. If someone starts editing it before
+        # that footer is added (later, during the next stage), then they'll risk
+        # to lose the text! So we have no choice but to force the user to wait.
+        # The URL will anyway be printed at the "Updating PR" stage, we don't
+        # need to double-print it.
+        print(
+            f"  ── new Pull Request created"
+            + (f" ({comment})" if comment else "")
+            + (f": {debug_url}" if debug_url else "")
+        )
         sys.stdout.flush()
 
     #
@@ -1440,7 +1850,7 @@ class Main:
             lines.append(
                 f"{c.hash} | {url.ljust(max_url_len)} | {head_branch.ljust(max_head_branch_len)} | {state.ljust(max_state_len)} | {c.title}"
             )
-        self.debug_log_text(text="\n".join(lines))
+        self.debug_log_text(text=lines)
 
     #
     # Logs a command which is run by the tool.
@@ -1450,12 +1860,14 @@ class Main:
         *,
         cmd: list[str],
         env: dict[str, str] | None,
+        input: str | None = None,
         out: str | None,
         took_s: float,
         returncode: int | None,
         comment: str | None = None,
     ):
         rows: list[tuple[tuple[int, int, int], str]] = []
+
         rows.append(
             (
                 DEBUG_COLOR_GRAY_1,
@@ -1476,11 +1888,16 @@ class Main:
                 + (f" # {comment}" if comment else ""),
             )
         )
+
+        if input:
+            rows.append((DEBUG_COLOR_GRAY_1, input))
+
         if out:
             rows.append(
                 (
                     DEBUG_COLOR_GRAY_2,
-                    re.sub(
+                    ("Output:\n" if input else "")
+                    + re.sub(
                         r"^",
                         "  ",
                         re.sub(r"\n([| \t]*\n)+", "\n", out.rstrip()),
@@ -1492,7 +1909,7 @@ class Main:
         if os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR):
             rows = [(row[0], re.sub(r"^", "> ", row[1], flags=re.M)) for row in rows]
 
-        self.debug_log_text(text="\n".join(row[1] for row in rows))
+        self.debug_log_text(text=[row[1] for row in rows])
         if self.debug:
             for row in rows:
                 print(colored(*row[0], row[1]))
@@ -1501,7 +1918,7 @@ class Main:
     #
     # Logs a text block (prepended by date) to the debug file.
     #
-    def debug_log_text(self, *, text: str):
+    def debug_log_text(self, *, text: str | list[str]):
         try:
             with open(DEBUG_FILE, "a+") as file:
                 file.write(
@@ -1513,6 +1930,8 @@ class Main:
                     )
                     + "\n"
                 )
+                if not isinstance(text, str):
+                    text = "\n".join(text)
                 file.write(f"{text.rstrip()}\n")
                 file.write("\n")
         except:
@@ -1595,10 +2014,22 @@ def clean_title(title: str) -> str:
 
 
 #
+# Removes common leading whitespace from each line.
+#
+def unindent(text: str) -> str:
+    text = re.sub(r"^([ \t\r]*\n)+", "", text, flags=re.S).rstrip()
+    matches = re.match(r"^[ \t]+", text, flags=re.S)
+    if matches:
+        text = re.sub(f"^{matches.group(0)}", "", text, flags=re.M)
+    return text
+
+
+#
 # If there is no body suffix in the body, appends it. Otherwise, replaces the
 # previous occurrence of the body suffix (heuristically found) with the new one.
 #
 def body_suffix_upsert(
+    *,
     body: str,
     pr_numbers: list[int],
     pr_number_current: int | None,
@@ -1616,6 +2047,55 @@ def body_suffix_upsert(
 
 
 #
+# Builds a body from an injected text.
+#
+def body_build_from_injected_text(
+    *,
+    injected_text: AiInjectedText,
+) -> str:
+    return re.sub(
+        r"\s*" + re.escape(AI_PLACEHOLDER) + r"\s*",
+        f"\n\n{injected_text.text}\n\n",
+        injected_text.template_with_placeholder,
+    )
+
+
+#
+# Finds a previously known AI-generated snippet in the body and replaces it with
+# AI_PLACEHOLDER marker, then returns an AiInjectedText object. It's an inverse
+# of body_build_from_injected_text() basically.
+#
+def body_convert_to_injected_text(
+    *,
+    body: str,
+    ai_generated_snippets: list[str],
+) -> AiInjectedText | None:
+    body = body.replace("\r", "")
+    for snippet in ai_generated_snippets:
+        pr_template = body.replace(snippet, AI_PLACEHOLDER)
+        if pr_template != body:
+            return AiInjectedText(
+                template_with_placeholder=pr_template,
+                text=snippet,
+            )
+    return None
+
+
+#
+# Returns an AI hash comment.
+#
+def ai_hash_build(hash: str) -> str:
+    return re.sub(r"(?=-->)", ":" + hash, AI_PLACEHOLDER)
+
+
+#
+# Extracts a hash from a body if it has an AI comment..
+#
+def ai_hash_extract(body: str) -> str | None:
+    return m.group(1) if (m := re.search(ai_hash_build("([a-f0-9]+)"), body)) else None
+
+
+#
 # Hashes a text, but keeps it recognizable. Seems like in some shells, we can't
 # have env variables with arbitrary characters, so we have to normalize
 # (otherwise, some tests fail in GitHub Actions).
@@ -1624,8 +2104,15 @@ def hashify(text: str) -> str:
     return (
         re.sub(r"^_+|_+$", "", re.sub(r"[^A-Za-z0-9]+", "_", text))
         + "_"
-        + hashlib.sha256(text.encode()).hexdigest()[0:8]
+        + short_hash(text)
     )
+
+
+#
+# Returns a short hash of a stripped text.
+#
+def short_hash(text: str) -> str:
+    return hashlib.sha256(text.strip().encode()).hexdigest()[0:8]
 
 
 #
