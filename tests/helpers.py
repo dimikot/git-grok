@@ -69,6 +69,11 @@ def git_init_and_cd_to_test_dir(
     initial_branch: str,
     method: Literal["push.default", "set-upstream"],
 ):
+    chdir(dirname(GIT_GROK_PATH))
+    settings_file_path: str | None = git_grok.find_file_in_parents(
+        git_grok.SETTINGS_FILE
+    )
+
     for path in Path(dir).glob("*"):
         if path.is_dir():
             rmtree(path)
@@ -100,6 +105,9 @@ def git_init_and_cd_to_test_dir(
     token = environ.get("GIT_GROK_TEST_GH_TOKEN")
     if token:
         environ["GH_TOKEN"] = token
+
+    if settings_file_path:
+        check_output_x("cp", "-af", settings_file_path, git_grok.SETTINGS_FILE)
 
     check_output_x("git", "commit", "--allow-empty", "-m", "Initial commit")
 
