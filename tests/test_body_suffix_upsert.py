@@ -7,7 +7,7 @@ class Test(TestCase):
     def test_idempotent(self):
         self.assertEqual(
             git_grok.body_suffix_upsert(
-                dedent(
+                body=dedent(
                     f"""
                     {git_grok.BODY_SUFFIX_TITLE}
                     - #101
@@ -15,8 +15,8 @@ class Test(TestCase):
                     {git_grok.BODY_SUFFIX_FOOTER}
                     """
                 ),
-                [101],
-                42,
+                pr_numbers=[101],
+                pr_number_current=42,
             ),
             dedent(
                 f"""
@@ -31,15 +31,15 @@ class Test(TestCase):
     def test_append(self):
         self.assertEqual(
             git_grok.body_suffix_upsert(
-                dedent(
+                body=dedent(
                     """
                     Here is
                     some text
 
                     """
                 ),
-                [101, 42],
-                42,
+                pr_numbers=[101, 42],
+                pr_number_current=42,
             ),
             dedent(
                 f"""
@@ -58,7 +58,7 @@ class Test(TestCase):
     def test_update_end_and_with_empty_lines(self):
         self.assertEqual(
             git_grok.body_suffix_upsert(
-                dedent(
+                body=dedent(
                     """
                     ## PRs in the Stack
 
@@ -71,8 +71,8 @@ class Test(TestCase):
 
                     """
                 ),
-                [101],
-                42,
+                pr_numbers=[101],
+                pr_number_current=42,
             ),
             dedent(
                 f"""
@@ -88,7 +88,7 @@ class Test(TestCase):
     def test_update_end_no_footer(self):
         self.assertEqual(
             git_grok.body_suffix_upsert(
-                dedent(
+                body=dedent(
                     """
                     ## PRs in the Stack
                     - #11
@@ -96,8 +96,8 @@ class Test(TestCase):
                     - #33
                     """
                 ),
-                [101],
-                42,
+                pr_numbers=[101],
+                pr_number_current=42,
             ),
             dedent(
                 f"""
@@ -112,7 +112,7 @@ class Test(TestCase):
     def test_update_middle_no_footer(self):
         self.assertEqual(
             git_grok.body_suffix_upsert(
-                dedent(
+                body=dedent(
                     """
                     Here is
                     some text
@@ -126,8 +126,8 @@ class Test(TestCase):
                     text
                     """
                 ),
-                [101],
-                42,
+                pr_numbers=[101],
+                pr_number_current=42,
             ),
             dedent(
                 f"""
@@ -147,7 +147,7 @@ class Test(TestCase):
 
     def test_update_middle_with_footer(self):
         result = git_grok.body_suffix_upsert(
-            dedent(
+            body=dedent(
                 f"""
                     ## PRs in the Stack
                     - #11
@@ -158,8 +158,8 @@ class Test(TestCase):
                     {git_grok.BODY_SUFFIX_FOOTER}
                     """
             ),
-            [101],
-            42,
+            pr_numbers=[101],
+            pr_number_current=42,
         )
         self.assertEqual(
             result,
@@ -173,22 +173,26 @@ class Test(TestCase):
             ),
         )
         self.assertEqual(
-            git_grok.body_suffix_upsert(result, [101], 42),
+            git_grok.body_suffix_upsert(
+                body=result,
+                pr_numbers=[101],
+                pr_number_current=42,
+            ),
             result,
         )
 
     def test_update_no_items(self):
         self.assertEqual(
             git_grok.body_suffix_upsert(
-                dedent(
+                body=dedent(
                     f"""
                     Some text
                     ## PRs in the Stack
                     Something else
                     """
                 ),
-                [101],
-                42,
+                pr_numbers=[101],
+                pr_number_current=42,
             ),
             dedent(
                 f"""
