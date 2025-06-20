@@ -9,6 +9,7 @@ import random
 import re
 import shlex
 import signal
+import ssl
 import subprocess
 import sys
 import traceback
@@ -20,7 +21,7 @@ from threading import Thread, current_thread, main_thread
 from time import time, sleep
 from typing import Any, Callable, Literal, TypeVar, Generic, cast
 from urllib.request import Request, urlopen
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 
 BRANCH_PREFIX = "grok/"
 PR_HEADER = "Pull Request"
@@ -1441,7 +1442,13 @@ class Main:
         res = None
         returncode = None
         try:
-            with urlopen(req) as res:
+            # MacOS Python 3.10 doesn't seem to have OpenAI certs. It raises the
+            # error: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed:
+            # unable to get local issuer certificate.
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            with urlopen(req, context=context) as res:
                 res = json.load(res)
                 res = str(res["choices"][0]["message"]["content"].strip())
                 parts = [part.strip() for part in res.split(AI_SEPARATOR)]
@@ -1455,6 +1462,9 @@ class Main:
             res = e.read().decode()
             returncode = e.code
             raise UserException(f"{e.code} {e.reason}: {res}")
+        except URLError as e:
+            returncode = -1
+            raise UserException(f"Network error: {e}")
         finally:
             self.debug_log_shell_command(
                 cmd=["curl", "-X", "POST", req.full_url],
