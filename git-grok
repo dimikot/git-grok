@@ -60,19 +60,14 @@ AI_WHO_YOU_ARE = """
     You are a senior software engineer who writes professional, concise, and
     informative pull request descriptions.
 """
-AI_PROMPT = f"""
-    # Response format
+AI_PROMPT_INJECT_PLACEHOLDER = f"""
+    I am passing you the Pull Request Template text. Modify it according to the
+    instructions below and return the text back to me.
 
-    The response MUST consist of EXACTLY 2 parts separated by the EXACT
-    "{AI_SEPARATOR}" marker located on a separate line. Those 2 parts are:
-    Modified PR Template and Pull Request Summary.
-
-    ## 1st Part: Modified PR Template
-
-    - The 1st part of the response is the exact text of the PR template that I
-      passed in the input, BUT with "{AI_PLACEHOLDER}" marker injected on a
-      separate line at the place where it will make sense to insert the Pull
-      Request Summary later.
+    - It must be the exact text of the Pull Request Template that I passed in
+      the input, BUT with "{AI_PLACEHOLDER}" marker injected on a separate line
+      at the place where it will make sense for me to later insert the Pull
+      Request Summary.
     - Your goal is to detect the single best place for this "{AI_PLACEHOLDER}"
       marker injection and inject it there. At the place where a human-readable
       summary would be expected.
@@ -82,14 +77,31 @@ AI_PROMPT = f"""
     - Only include the response text in that part. Don't add any comments or
       thoughts, just the text of the PR template with the "{AI_PLACEHOLDER}"
       marker injected at the best place.
+"""
+AI_PROMPT_GENERATE_SUMMARY = f"""
+    I am passing you the Pull Request Title and the code diff. Generate the Pull
+    Request Summary according to the following instructions.
 
-    ## 2nd Part: Pull Request Summary
+    Guidelines for all of the texts you generate:
 
-    - The 2nd part of the response must be a concise, informative, and
-      professional pull request summary. When building, infer the information
-      from the PR title and the diff provided. Don't be too short, but also
-      don't be too verbose: the result should be pleasant for a human engineer
-      to read and understand.
+    - NEVER USE THE EXAGGERATION WORDS LIKE "CRITICAL", "CRUCIAL", "SIGNIFICANT"
+      AND ANY OTHER WORDS WITH SIMILAR MEANING. Avoid pompous phrases like "This
+      is a crucial step", "This change is foundational", "This is a significant
+      enhancement" etc. Overall, be humble, don't try to judge the PR change and
+      its importance; just provide the dry facts.
+    - DON'T HALLUCINATE! If you're not sure about something, better not mention
+      it than hallucinate. Also, do not say "likely" - avoid guessing! If
+      unsure, try to infer hints from the PR title.
+
+    # Top Part: Summary
+
+    - Generate a concise, informative, and professional Pull Request Summary.
+      When building, infer the information from the Pull Request Title and the
+      diff provided.
+    - Do not generate "Summary" sub-header or any other sub-headers. Instead,
+      just generate the text (one or multiple paragraphs).
+    - Don't be too short, but also don't be too verbose: the result should be
+      pleasant for a human engineer to read and understand.
     - Use PR title; it is provided as a hint for the PRIMARY ESSENCE of the
       change in the diff (especially when unsure, or when there are multiple
       unrelated changes in the diff). The title is manually created by the diff
@@ -107,17 +119,14 @@ AI_PROMPT = f"""
     - NEVER TRY TO FILL ANY TEST STEPS OR TEST PLAN in the summary; only build
       human-readable text. Your goal is NOT to create test plans. Your goal is
       to only fill the human readable summary of the change.
-    - Avoid pompous phrases like "This is a crucial step", "This change is
-      foundational" etc.
-    - DON'T HALLUCINATE! If you're not sure about something, better not mention
-      it than hallucinate. Again, try to infer hints from the PR title.
 
-    ### Ending of the 2nd Part: Essential Code Lines (Optional)
+    # Bottom part: Essential Code Lines (Optional)
 
-    - In the end of the 2nd part text, extract 1-5 most "essential code lines"
-      from the diff and mention these extracted lines in a code block (markdown;
-      use the language tag in triple-backtick syntax).
-    - Make sure that those "essential code lines" ARE SOMEHOW RELATED to the PR
+    - In the end, extract 1-5 most "Essential Code Lines" from the diff and
+      mention these extracted lines in a code block (markdown; use the language
+      tag in triple-backtick syntax).
+    - Use "Essential Code Lines" as a subheader.
+    - Make sure that those "Essential Code Lines" ARE SOMEHOW RELATED to the PR
       title provided. Typically, when author of a PR writes its title, it has
       some essential code lines in mind; try to infer them based on the title if
       possible or when unsure.
@@ -125,8 +134,8 @@ AI_PROMPT = f"""
       triple-backtick text you're about to inject is empty, simply skip this
       ending of block 2 and don't even mention that it's absent (since it's
       optional).
-    - Otherwise, give the corresponding explanation of the Essential Code Lines
-      as well (in a very short form).
+    - Otherwise, append the corresponding explanation of the Essential Code
+      Lines as well (in a very short form, as 1 paragraph below the code block).
     - Avoid pompous phrases like "This is a crucial step", "This change is
       foundational" etc.
     - NEVER TREAT import (or module inclusion, require etc.) statements as
@@ -776,15 +785,14 @@ class Main:
 
         self.print_ai_generating()
 
-        prompt = self.ai_build_prompt(
-            title=commit.title,
-            diff=self.git_get_commit_diff(commit_hash=commit.hash),
-            pr_template=pr_template or AI_DEFAULT_PR_TEMPLATE,
-        )
         injected_text = self.ai_generate_injected_text(
-            api_key=self.settings.ai_api_key,
-            model=self.settings.ai_model,
-            prompt=prompt,
+            prompt_inject_placeholder=self.ai_build_prompt_inject_placeholder(
+                pr_template=pr_template or AI_DEFAULT_PR_TEMPLATE,
+            ),
+            prompt_generate_summary=self.ai_build_prompt_generate_summary(
+                title=commit.title,
+                diff=self.git_get_commit_diff(commit_hash=commit.hash),
+            ),
         )
         self.settings.ai_generated_snippets.insert(0, injected_text.text)
         self.settings_merge_save()
@@ -1375,51 +1383,59 @@ class Main:
                     str(self.settings.ai_temperature if self.settings else ""),
                     str(AI_DIFF_CONTEXT_LINES),
                     unindent(AI_WHO_YOU_ARE),
-                    unindent(AI_PROMPT).rstrip(),
+                    unindent(AI_PROMPT_INJECT_PLACEHOLDER).rstrip(),
+                    unindent(AI_PROMPT_GENERATE_SUMMARY).rstrip(),
                 ]
             )
         )
 
     #
+    # Builds a prompt for the AI to inject a placeholder to the PR template.
+    #
+    def ai_build_prompt_inject_placeholder(
+        self,
+        *,
+        pr_template: str,
+    ) -> AiPrompt:
+        pr_template = pr_template.strip() + "\n" if pr_template.strip() else ""
+        return AiPrompt(
+            who_you_are=unindent(AI_WHO_YOU_ARE).rstrip(),
+            prompt=unindent(AI_PROMPT_INJECT_PLACEHOLDER).rstrip(),
+            input=f"Here is the {PR_TEMPLATE_FILE} developers use:\n{AI_SEPARATOR}\n{pr_template}{AI_SEPARATOR}\n\n",
+        )
+
+    #
     # Builds a prompt for the AI to generate a PR description.
     #
-    def ai_build_prompt(
+    def ai_build_prompt_generate_summary(
         self,
         *,
         title: str,
         diff: str,
-        pr_template: str,
     ) -> AiPrompt:
-        sep = "-" * 60
+        title = title.strip() + "\n" if title.strip() else ""
         diff = diff.strip() + "\n" if diff.strip() else ""
-        pr_template = pr_template.strip() + "\n" if pr_template.strip() else ""
-        who_you_are = unindent(AI_WHO_YOU_ARE).rstrip()
-        prompt = unindent(AI_PROMPT).rstrip()
-        input = (
-            f"Here is the PR title:\n{sep}\n{title.strip()}{sep}\n\n"
-            + f"Here is the {PR_TEMPLATE_FILE} developers use:\n{sep}\n{pr_template}{sep}\n\n"
-            + f"Here is the git diff:\n{sep}\n{diff}{sep}\n\n"
-        ).rstrip()
         return AiPrompt(
-            who_you_are=who_you_are,
-            prompt=prompt,
-            input=input,
+            who_you_are=unindent(AI_WHO_YOU_ARE).rstrip(),
+            prompt=unindent(AI_PROMPT_GENERATE_SUMMARY).rstrip(),
+            input=(
+                f"Here is the PR title:\n{AI_SEPARATOR}\n{title}{AI_SEPARATOR}\n\n"
+                + f"Here is the git diff:\n{AI_SEPARATOR}\n{diff}{AI_SEPARATOR}\n\n"
+            ),
         )
 
     #
-    # Generates an injected text block (like PR summary).
+    # Sends an AI request and returns the text response.
     #
-    def ai_generate_injected_text(
+    def ai_send_request(
         self,
         *,
-        api_key: str,
-        model: str,
         prompt: AiPrompt,
-    ) -> AiInjectedText:
+    ) -> str:
         assert self.settings
         data = json.dumps(
             {
-                "model": model,
+                "model": self.settings.ai_model,
                 "messages": [
                     {"role": "system", "content": prompt.who_you_are},
                     {"role": "system", "content": prompt.prompt},
@@ -1434,7 +1450,7 @@ class Main:
             "https://api.openai.com/v1/chat/completions",
             data=data.encode(),
             headers={
-                "Authorization": f"Bearer {api_key}",
+                "Authorization": f"Bearer {self.settings.ai_api_key}",
                 "Content-Type": "application/json",
             },
         )
@@ -1450,14 +1466,7 @@ class Main:
             context.verify_mode = ssl.CERT_NONE
             with urlopen(req, context=context) as res:
                 res = json.load(res)
-                res = str(res["choices"][0]["message"]["content"].strip())
-                parts = [part.strip() for part in res.split(AI_SEPARATOR)]
-                if len(parts) != 2:
-                    raise UserException(f"Invalid response from AI:\n[[[\n{res}\n]]]")
-                return AiInjectedText(
-                    template_with_placeholder=parts[0],
-                    text=ai_hash_build(self.ai_get_rules_hash()) + "\n" + parts[1],
-                )
+                return str(res["choices"][0]["message"]["content"].strip())
         except HTTPError as e:
             res = e.read().decode()
             returncode = e.code
@@ -1474,6 +1483,32 @@ class Main:
                 took_s=time() - time_start,
                 returncode=returncode,
             )
+
+    #
+    # Generates an injected text block (like PR summary).
+    #
+    def ai_generate_injected_text(
+        self,
+        *,
+        prompt_inject_placeholder: AiPrompt,
+        prompt_generate_summary: AiPrompt,
+    ) -> AiInjectedText:
+        task_inject_placeholder = Task(
+            self.ai_send_request,
+            prompt=prompt_inject_placeholder,
+        )
+        task_generate_summary = Task(
+            self.ai_send_request,
+            prompt=prompt_generate_summary,
+        )
+        return AiInjectedText(
+            template_with_placeholder=task_inject_placeholder.wait().strip(),
+            text=(
+                ai_hash_build(self.ai_get_rules_hash())
+                + "\n"
+                + task_generate_summary.wait().strip()
+            ),
+        )
 
     #
     # Runs a shell command returning results.
@@ -2100,7 +2135,7 @@ def ai_hash_build(hash: str) -> str:
 
 
 #
-# Extracts a hash from a body if it has an AI comment..
+# Extracts a hash from a body if it has an AI comment.
 #
 def ai_hash_extract(body: str) -> str | None:
     return m.group(1) if (m := re.search(ai_hash_build("([a-f0-9]+)"), body)) else None
