@@ -197,8 +197,9 @@ def git_init_and_cd_to_test_dir(
     # branch has already been deleted by a parallel test run or so).
 
 
-def git_touch(file: str):
-    check_output_x("touch", file)
+def git_touch(file: str, content: str | None = None):
+    with open(file, "w") as f:
+        f.write(content or "")
 
 
 def git_add_commit(msg: str):

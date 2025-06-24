@@ -2052,8 +2052,9 @@ def body_suffix_upsert(
         BODY_SUFFIX_TITLE + "\n" + "\n".join(items) + "\n\n" + BODY_SUFFIX_FOOTER + "\n"
     )
     if re.search(BODY_SUFFIX_RE, body, flags=re.M | re.I | re.X):
-        return re.sub(BODY_SUFFIX_RE, suffix, body, flags=re.M | re.I | re.X)
-    return body.rstrip() + "\n\n" + suffix
+        return re.sub(BODY_SUFFIX_RE, lambda _: suffix, body, flags=re.M | re.I | re.X)
+    else:
+        return body.rstrip() + "\n\n" + suffix
 
 
 #
@@ -2065,7 +2066,7 @@ def body_build_from_injected_text(
 ) -> str:
     return re.sub(
         r"\s*" + re.escape(AI_PLACEHOLDER) + r"\s*",
-        f"\n\n{injected_text.text}\n\n",
+        lambda _: f"\n\n{injected_text.text}\n\n",
         injected_text.template_with_placeholder,
     )
 
@@ -2095,7 +2096,7 @@ def body_convert_to_injected_text(
 # Returns an AI hash comment.
 #
 def ai_hash_build(hash: str) -> str:
-    return re.sub(r"(?=-->)", ":" + hash, AI_PLACEHOLDER)
+    return re.sub(r"(?=-->)", lambda _: f":{hash}", AI_PLACEHOLDER)
 
 
 #
