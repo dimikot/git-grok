@@ -175,7 +175,7 @@ def git_init_and_cd_to_test_dir(
     tasks = [
         GarbageTask(
             kind=pr.kind,
-            task=git_grok.Task(check_output_x, "gh", "pr", "close", pr.name),
+            task=git_grok.Task(gh_pr_close_if_open, pr.name),
         )
         for pr in prs
     ] + [
@@ -195,6 +195,15 @@ def git_init_and_cd_to_test_dir(
     [task.task.wait() for task in tasks if task.kind == "sync"]
     # Leave async tasks work in background and swallow errors (e.g. in case a
     # branch has already been deleted by a parallel test run or so).
+
+
+def gh_pr_close_if_open(name: str):
+    try:
+        check_output_x("gh", "pr", "close", name)
+    except CalledProcessError as e:
+        if "Could not close the pull request" in e.stderr:
+            return
+        raise
 
 
 def git_touch(file: str, content: str | None = None):
