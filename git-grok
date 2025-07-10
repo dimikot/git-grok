@@ -71,7 +71,12 @@ AI_PROMPT_INJECT_PLACEHOLDER = f"""
     - Your goal is to detect the single best place for this "{AI_PLACEHOLDER}"
       marker injection and inject it there. At the place where a human-readable
       summary would be expected.
-    - You are not allowed to remove a single character in the PR template!
+    - You are NOT ALLOWED to remove a single character in the PR template!
+    - You are NOT ALLOWED to add any new lines to the PR template EXCEPT that
+      "{AI_PLACEHOLDER}" marker! I.e. you must always add exactly one new line
+      with that marker, not more.
+    - Never wrap anything with markdown blocks or something like that. Follow
+      the rules above!
     - Never change sub-headers, surrounding text etc. there.
     - Do not delete any sections, even if those sections appear empty.
     - Only include the response text in that part. Don't add any comments or
@@ -747,6 +752,7 @@ class Main:
 
         assert commit.url is not None
         pr = self.gh_get_pr(url=commit.url)
+        body = pr.body
 
         self.settings_load()
         if self.settings:
@@ -758,7 +764,7 @@ class Main:
                 rules_hash = ai_hash_extract(injected_text.text)
                 if rules_hash != self.ai_get_rules_hash():
                     commit.title = pr.title
-                    pr.body = self.process_build_pr_body_with_ai(
+                    body = self.process_build_pr_body_with_ai(
                         commit=commit,
                         pr_template=injected_text.template_with_placeholder,
                     )
@@ -769,6 +775,7 @@ class Main:
             head_commit_hash=commit.hash,
             pr_numbers=pr_numbers,
             pr_number_current=pr_number_current,
+            body=body,
         )
 
     #
@@ -784,10 +791,13 @@ class Main:
             return pr_template or ""
 
         self.print_ai_generating()
+        pr_template = pr_template or AI_DEFAULT_PR_TEMPLATE
 
         injected_text = self.ai_generate_injected_text(
-            prompt_inject_placeholder=self.ai_build_prompt_inject_placeholder(
-                pr_template=pr_template or AI_DEFAULT_PR_TEMPLATE,
+            prompt_inject_placeholder=(
+                pr_template
+                if AI_PLACEHOLDER in pr_template
+                else self.ai_build_prompt_inject_placeholder(pr_template=pr_template)
             ),
             prompt_generate_summary=self.ai_build_prompt_generate_summary(
                 title=commit.title,
@@ -929,12 +939,13 @@ class Main:
         head_commit_hash: str,
         pr_numbers: list[int],
         pr_number_current: int | None,
+        body: str,
     ) -> tuple[Pr, PrUpsertResult]:
         if base_branch is None:
             base_branch = self.remote_base_branch
 
-        new_body = body_suffix_upsert(
-            body=pr.body,
+        body = body_suffix_upsert(
+            body=body,
             pr_numbers=pr_numbers,
             pr_number_current=pr_number_current,
         )
@@ -945,7 +956,7 @@ class Main:
 
         if (
             pr.base_branch == base_branch
-            and pr.body == new_body
+            and pr.body == body
             and pr.state == "OPEN"
             and (MIDDLE_PR_LABEL in pr.labels) == is_middle_pr
         ):
@@ -1027,11 +1038,11 @@ class Main:
                 "--body-file",
                 "-",
             ],
-            input=new_body,
+            input=body,
         )
 
         pr.base_branch = base_branch
-        pr.body = new_body
+        pr.body = body
         return pr, upsert_result
 
     #
@@ -1490,12 +1501,13 @@ class Main:
     def ai_generate_injected_text(
         self,
         *,
-        prompt_inject_placeholder: AiPrompt,
+        prompt_inject_placeholder: AiPrompt | str,
         prompt_generate_summary: AiPrompt,
     ) -> AiInjectedText:
-        task_inject_placeholder = Task(
-            self.ai_send_request,
-            prompt=prompt_inject_placeholder,
+        task_inject_placeholder = (
+            Task(lambda: prompt_inject_placeholder)
+            if isinstance(prompt_inject_placeholder, str)
+            else Task(self.ai_send_request, prompt=prompt_inject_placeholder)
         )
         task_generate_summary = Task(
             self.ai_send_request,
