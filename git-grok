@@ -61,6 +61,8 @@ AI_WHO_YOU_ARE = """
     informative pull request descriptions.
 """
 AI_PROMPT_INJECT_PLACEHOLDER = f"""
+    # INSTRUCTIONS
+
     I am passing you the Pull Request Template text. Modify it according to the
     instructions below and return the text back to me.
 
@@ -82,6 +84,38 @@ AI_PROMPT_INJECT_PLACEHOLDER = f"""
     - Only include the response text in that part. Don't add any comments or
       thoughts, just the text of the PR template with the "{AI_PLACEHOLDER}"
       marker injected at the best place.
+
+    # EXAMPLE 1
+
+    Input:
+
+        ## Summary
+
+        ## How was this tested?
+
+    Output I expect from you:
+
+        ## Summary
+
+        {AI_PLACEHOLDER}
+
+        ## How was this tested?
+
+    # EXAMPLE 2
+
+    Input:
+
+        Overview
+
+        Something else
+
+    Output I expect from you:
+
+        Overview
+
+        {AI_PLACEHOLDER}
+
+        Something else
 """
 AI_PROMPT_GENERATE_SUMMARY = f"""
     I am passing you the Pull Request Title and the code diff. Generate the Pull
