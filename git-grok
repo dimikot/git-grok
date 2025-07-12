@@ -118,7 +118,7 @@ AI_PROMPT_INJECT_PLACEHOLDER = f"""
         Something else
 """
 AI_PROMPT_GENERATE_SUMMARY = f"""
-    I am passing you the Pull Request Title and the code diff. Generate the Pull
+    I am passing you a Pull Request Title a the code diff. Generate the Pull
     Request Summary according to the following instructions.
 
     Guidelines for all of the texts you generate:
@@ -1443,10 +1443,11 @@ class Main:
         pr_template: str,
     ) -> AiPrompt:
         pr_template = pr_template.strip() + "\n" if pr_template.strip() else ""
+        excluding = f"(excluding the {AI_SEPARATOR[0:4]}... separator)"
         return AiPrompt(
             who_you_are=unindent(AI_WHO_YOU_ARE).rstrip(),
             prompt=unindent(AI_PROMPT_INJECT_PLACEHOLDER).rstrip(),
-            input=f"Here is the {PR_TEMPLATE_FILE} developers use:\n{AI_SEPARATOR}\n{pr_template}{AI_SEPARATOR}\n\n",
+            input=f"Here is the {PR_TEMPLATE_FILE} developers use {excluding}:\n{AI_SEPARATOR}\n{pr_template}{AI_SEPARATOR}\n\n",
         )
 
     #
@@ -1460,12 +1461,13 @@ class Main:
     ) -> AiPrompt:
         title = title.strip() + "\n" if title.strip() else ""
         diff = diff.strip() + "\n" if diff.strip() else ""
+        excluding = f"(excluding the {AI_SEPARATOR[0:4]}... separator)"
         return AiPrompt(
             who_you_are=unindent(AI_WHO_YOU_ARE).rstrip(),
             prompt=unindent(AI_PROMPT_GENERATE_SUMMARY).rstrip(),
             input=(
-                f"Here is the PR title:\n{AI_SEPARATOR}\n{title}{AI_SEPARATOR}\n\n"
-                + f"Here is the git diff:\n{AI_SEPARATOR}\n{diff}{AI_SEPARATOR}\n\n"
+                f"Here is the PR title {excluding}:\n{AI_SEPARATOR}\n{title}{AI_SEPARATOR}\n\n"
+                + f"Here is the git diff {excluding}:\n{AI_SEPARATOR}\n{diff}{AI_SEPARATOR}\n\n"
             ),
         )
 
