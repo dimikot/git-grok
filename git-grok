@@ -144,7 +144,9 @@ AI_PROMPT_GENERATE_SUMMARY = f"""
     - Use PR title; it is provided as a hint for the PRIMARY ESSENCE of the
       change in the diff (especially when unsure, or when there are multiple
       unrelated changes in the diff). The title is manually created by the diff
-      author, so it must be good enough.
+      author, so it must be good enough. When using that information from the PR
+      title, ignore all prefix or suffix parts in () or []: e.g. if given
+      "feat(abc): bla bla [xyz]", ignore "(abc)" and "[xyz]" parts.
     - Do not duplicate the title in the Pull Request Summary! E.g. don't say
       something like "This pull request titled "..." does ...". The title
       information is already in the PR title, no sense in duplicating it in the
@@ -161,9 +163,9 @@ AI_PROMPT_GENERATE_SUMMARY = f"""
 
     # Bottom part: Essential Code Lines (Optional)
 
-    - In the end, extract 1-5 most "Essential Code Lines" from the diff and
-      mention these extracted lines in a code block (markdown; use the language
-      tag in triple-backtick syntax).
+    - In the end, extract most "Essential Code Lines" from the diff (NOT MORE
+      THAN 5 LINES!!!) and mention top 5 of those extracted lines in a code
+      block (markdown; use the language tag in triple-backtick syntax).
     - Use "Essential Code Lines" as a subheader.
     - Make sure that those "Essential Code Lines" ARE SOMEHOW RELATED to the PR
       title provided. Typically, when author of a PR writes its title, it has
