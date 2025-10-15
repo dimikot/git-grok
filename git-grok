@@ -335,6 +335,9 @@ class Main:
     def run(self):
         self.debug_log_argv()
 
+        # A work-around for ClickUp Inc.
+        os.environ["ALLOW_ADMIN_OVERRIDE"] = "1"
+
         parser = argparse.ArgumentParser(
             description="Pushes local commits as stacked PRs on GitHub and keeps them in sync.",
         )
