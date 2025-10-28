@@ -1499,7 +1499,7 @@ class Main:
             indent=2,
         )
         req = Request(
-            "https://api.openai.com/v1/chat/completions",
+            "https://us.api.openai.com/v1/chat/completions",
             data=data.encode(),
             headers={
                 "Authorization": f"Bearer {self.settings.ai_api_key}",
