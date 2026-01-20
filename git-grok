@@ -322,6 +322,7 @@ T = TypeVar("T")
 class Main:
     settings: Settings | None = None
     in_rebase_interactive: InRebaseInteractiveData | None = None
+    draft: bool = False
     debug: bool = False
     debug_force_push_branches: bool = False
     debug_skip_update_existing_prs: bool = False
@@ -353,6 +354,12 @@ class Main:
             action="store_true",
             help="if passed, forces all branches to be re-created and re-pushed",
         )
+        parser.add_argument(
+            "--draft",
+            default=False,
+            action="store_true",
+            help="create pull requests as drafts",
+        )
         args = parser.parse_args()
 
         self.settings_load()
@@ -361,6 +368,7 @@ class Main:
             os.environ.get(INTERNAL_IN_REBASE_INTERACTIVE_VAR, "")
         )
 
+        self.draft = args.draft
         self.debug = args.debug
         self.debug_force_push_branches = args.debug_force_push_branches
         self.debug_skip_update_existing_prs = bool(
@@ -645,6 +653,7 @@ class Main:
                         if self.debug_force_push_branches
                         else []
                     ),
+                    *(["--draft"] if self.draft else []),
                 ]
             )
             todo = "".join(
@@ -931,6 +940,7 @@ class Main:
             "gh",
             "pr",
             "create",
+            *(["--draft"] if self.draft else []),
             "--base",
             base_branch,
             "--head",
