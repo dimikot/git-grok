@@ -406,6 +406,19 @@ class Main:
             )
             return
 
+        MAX_COMMITS_IN_STACK = 4
+        if len(commits) > MAX_COMMITS_IN_STACK:
+            if path := find_file_in_parents(".git/config"):
+                with open(path, "r") as f:
+                    config = f.read()
+                if "time-loop/" in config:
+                    raise UserException(
+                        f"We temporarily limit the number of PRs in the stack to {MAX_COMMITS_IN_STACK} to avoid overwhelming the CI infra.\n"
+                        + f"Super-large stacks are an anti-pattern.\n"
+                        + f"Please use standard git tooling (google for it!) to remove the top commits and keep the stack small,\n"
+                        + f"then rerun git grok, merge the PRs, put the remaining commits back, and continue."
+                    )
+
         task_upsert_labels = Task(self.gh_upsert_labels)
         tasks_gh_get_pr = dict(
             (url, Task(self.gh_get_pr, url=url))
