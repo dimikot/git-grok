@@ -406,7 +406,7 @@ class Main:
             )
             return
 
-        MAX_COMMITS_IN_STACK = 6
+        MAX_COMMITS_IN_STACK = 10
         if len(commits) > MAX_COMMITS_IN_STACK:
             if path := find_file_in_parents(".git/config"):
                 with open(path, "r") as f:
