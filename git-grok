@@ -1173,19 +1173,31 @@ class Main:
     # Returns the current remote branch name on GitHub.
     #
     def git_get_current_remote_base_branch(self) -> str:
-        branch = self.shell(["git", "branch", "--show-current"])
-        if not branch:
-            path = ".git/rebase-merge/head-name"
-            if file := find_file_in_parents(path):
-                branch = open(file).readline().strip()
-                if not (m := re.match(r"refs/heads/(.+)", branch)):
-                    raise UserException(f"File {path} doesn't contain refs/heads/*")
-                branch = m.group(1)
-            else:
+        # Worktrees: Favor upstream in case of local/remote name mismatch.
+        [_, upstream, _] = self.shell_no_throw(
+            ["git", "rev-parse", "--abbrev-ref", "@{upstream}"]
+        )
+        if upstream:
+            if not (m := re.match(r"^[^/]+/(.+)$", upstream)):
                 raise UserException(
-                    f"You must be on a branch or in an interactive rebase mode."
+                    f"Upstream {upstream} doesn't match <remote>/<branch> format."
                 )
-        return branch
+            return m.group(1)
+
+        branch = self.shell(["git", "branch", "--show-current"])
+        if branch:
+            return branch
+
+        path = ".git/rebase-merge/head-name"
+        if file := find_file_in_parents(path):
+            branch = open(file).readline().strip()
+            if not (m := re.match(r"refs/heads/(.+)", branch)):
+                raise UserException(f"File {path} doesn't contain refs/heads/*")
+            return m.group(1)
+        else:
+            raise UserException(
+                f"You must be on a branch or in an interactive rebase mode."
+            )
 
     #
     # Returns parsed commits between two refs in reverse-chronological order
